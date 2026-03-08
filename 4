@@ -1,0 +1,427 @@
+"""
+Backward Chaining Planner with Unification (Prolog/PDDL style)
+Supports:
+- Variable unification (?x, ?y, etc.)
+- Partial effect matching (action needs at least one relevant effect)
+- Substitution propagation through the plan
+- Cumulative state tracking (effects of planned actions enrich the state)
+- A* search mode with action costs and heuristic guidance
+- Diagnostic feedback for failed plans (unsatisfied goals, failed preconditions, suggestions)
+"""
+import heapq
+from dataclasses import dataclass, field
+from typing import Optional
+# ─── Unification Engine ───────────────────────────────────────────────
+def is_var(term) -> bool:
+    return isinstance(term, str) and term.startswith("?")
+def walk(term, subst: dict):
+    seen = set()
+    while is_var(term) and term in subst and term not in seen:
+        seen.add(term)
+        term = subst[term]
+    if isinstance(term, tuple):
+        return tuple(walk(t, subst) for t in term)
+    if isinstance(term, list):
+        return [walk(t, subst) for t in term]
+    return term
+def unify(t1, t2, subst: dict) -> Optional[dict]:
+    t1 = walk(t1, subst)
+    t2 = walk(t2, subst)
+    if t1 == t2:
+        return subst
+    if is_var(t1):
+        return {**subst, t1: t2}
+    if is_var(t2):
+        return {**subst, t2: t1}
+    if isinstance(t1, (tuple, list)) and isinstance(t2, (tuple, list)):
+        if len(t1) != len(t2):
+            return None
+        for a, b in zip(t1, t2):
+            subst = unify(a, b, subst)
+            if subst is None:
+                return None
+        return subst
+    return None
+def apply_subst(predicates: list, subst: dict) -> list:
+    return [walk(p, subst) for p in predicates]
+# ─── Action Definition ────────────────────────────────────────────────
+class Action:
+    def __init__(self, name: str, params: list, preconditions: list, effects: list, cost: float = 1.0):
+        self.name = name
+        self.params = params
+        self.pre = preconditions
+        self.eff = effects
+        self.cost = cost
+    def fresh(self, counter: int) -> "Action":
+        rename = {p: f"{p}_{counter}" for p in self.params}
+        return Action(
+            self.name,
+            [rename[p] for p in self.params],
+            apply_subst(self.pre, rename),
+            apply_subst(self.eff, rename),
+            self.cost,
+        )
+    def __repr__(self):
+        args = ", ".join(self.params)
+        return f"Action({self.name}({args}))"
+# ─── Diagnostics ──────────────────────────────────────────────────────
+@dataclass
+class Diagnosis:
+    """Detailed explanation of why planning failed."""
+    unsatisfied_goals: list = field(default_factory=list)
+    failed_preconditions: list = field(default_factory=list)
+    actions_tried: list = field(default_factory=list)
+    suggestions: list = field(default_factory=list)
+    max_depth_hit: bool = False
+    def summary(self) -> str:
+        lines = ["═══ PLAN FAILED ═══"]
+        if self.max_depth_hit:
+            lines.append("\\n⚠ Search depth limit reached. The plan may exist at greater depth.")
+        if self.unsatisfied_goals:
+            lines.append("\\n❌ Unsatisfied goals:")
+            for g in self.unsatisfied_goals:
+                lines.append(f"   • {g}")
+        if self.failed_preconditions:
+            lines.append("\\n🔒 Preconditions that could not be met:")
+            for action_name, pre in self.failed_preconditions:
+                lines.append(f"   • {action_name} requires: {pre}")
+        if self.actions_tried:
+            lines.append(f"\\n🔍 Actions considered: {', '.join(self.actions_tried)}")
+        if self.suggestions:
+            lines.append("\\n💡 Suggestions:")
+            for s in self.suggestions:
+                lines.append(f"   • {s}")
+        return "\\n".join(lines)
+@dataclass
+class PlanResult:
+    """Unified result for both successful and failed planning."""
+    success: bool
+    plan: list = field(default_factory=list)
+    substitution: dict = field(default_factory=dict)
+    cost: float = 0.0
+    diagnosis: Optional[Diagnosis] = None
+    def summary(self) -> str:
+        if self.success:
+            lines = ["═══ PLAN FOUND ═══"]
+            if self.cost > 0:
+                lines.append(f"Total cost: {self.cost}")
+            for i, (name, bindings) in enumerate(self.plan, 1):
+                bound = {k: v for k, v in bindings.items() if not is_var(v)}
+                if bound:
+                    args = ", ".join(f"{k}={v}" for k, v in bound.items())
+                    lines.append(f"  {i}. {name}({args})")
+                else:
+                    lines.append(f"  {i}. {name}()")
+            return "\\n".join(lines)
+        else:
+            return self.diagnosis.summary() if self.diagnosis else "No plan found (no diagnostics)."
+    # Structured output for LLM tool use
+    def to_dict(self) -> dict:
+        if self.success:
+            return {
+                "status": "success",
+                "plan": [
+                    {"step": i, "action": name, "bindings": {k: v for k, v in bindings.items() if not is_var(v)}}
+                    for i, (name, bindings) in enumerate(self.plan, 1)
+                ],
+                "cost": self.cost,
+            }
+        else:
+            d = self.diagnosis
+            return {
+                "status": "failure",
+                "unsatisfied_goals": [str(g) for g in (d.unsatisfied_goals if d else [])],
+                "failed_preconditions": [
+                    {"action": a, "requires": str(p)} for a, p in (d.failed_preconditions if d else [])
+                ],
+                "suggestions": d.suggestions if d else [],
+                "max_depth_hit": d.max_depth_hit if d else False,
+            }
+# ─── Diagnostic Analyzer ─────────────────────────────────────────────
+def diagnose_failure(goals, actions, state, subst=None) -> Diagnosis:
+    """Analyze why planning failed and produce actionable suggestions."""
+    if subst is None:
+        subst = {}
+    diag = Diagnosis()
+    # 1. Which goals are unsatisfied?
+    for g in goals:
+        resolved = walk(g, subst)
+        if matchesany(resolved, state, subst) is None:
+            diag.unsatisfied_goals.append(resolved)
+    # 2. Which actions could contribute but have unmet preconditions?
+    for goal in diag.unsatisfied_goals:
+        for action in actions:
+            for eff in action.eff:
+                test_subst = unify(eff, goal, subst.copy())
+                if test_subst is not None:
+                    diag.actions_tried.append(action.name)
+                    for pre in action.pre:
+                        resolved_pre = walk(pre, test_subst)
+                        if matchesany(resolved_pre, state, test_subst) is None:
+                            diag.failed_preconditions.append((action.name, resolved_pre))
+                    break  # one match per action is enough for diagnosis
+    # 3. Generate suggestions
+    all_effects = set()
+    for action in actions:
+        for eff in action.eff:
+            if isinstance(eff, tuple) and len(eff) > 0:
+                all_effects.add(eff[0])
+    for goal in diag.unsatisfied_goals:
+        predicate = goal[0] if isinstance(goal, tuple) and len(goal) > 0 else str(goal)
+        # Can any action produce this goal at all?
+        producers = [a.name for a in actions if any(
+            isinstance(e, tuple) and len(e) > 0 and e[0] == predicate for e in a.eff
+        )]
+        if not producers:
+            diag.suggestions.append(
+                f"No action produces '{predicate}'. Add an action with effect matching {goal}."
+            )
+        else:
+            diag.suggestions.append(
+                f"Goal {goal} could be produced by: {', '.join(producers)}. "
+                f"Check their preconditions or add missing facts to the initial state."
+            )
+    for action_name, pre in diag.failed_preconditions:
+        pre_pred = pre[0] if isinstance(pre, tuple) and len(pre) > 0 else str(pre)
+        if pre_pred not in all_effects:
+            diag.suggestions.append(
+                f"Precondition '{pre}' of '{action_name}' is not produced by any action. "
+                f"Add it to the initial state: state.add({pre})"
+            )
+    # Deduplicate
+    diag.actions_tried = list(dict.fromkeys(diag.actions_tried))
+    diag.suggestions = list(dict.fromkeys(diag.suggestions))
+    return diag
+# ─── Core Planner ─────────────────────────────────────────────────────
+_counter = 0
+def nextid():
+    global _counter
+    _counter += 1
+    return _counter
+def matchesany(goal, state, subst):
+    for fact in state:
+        result = unify(goal, fact, subst)
+        if result is not None:
+            return result
+    return None
+def backward_chain(
+    goals: list,
+    actions: list[Action],
+    state: set,
+    depth: int = 20,
+    subst: dict | None = None,
+    _trace: list | None = None,
+) -> PlanResult:
+    if subst is None:
+        subst = {}
+    if _trace is None:
+        _trace = []
+    result = _backward_chain_inner(goals, actions, state, depth, subst, _trace)
+    if result is not None:
+        plan, final_subst = result
+        # Resolve bindings in plan
+        resolved_plan = []
+        for name, bindings in plan:
+            resolved_bindings = {k: walk(v, final_subst) for k, v in bindings.items()}
+            resolved_plan.append((name, resolved_bindings))
+        return PlanResult(success=True, plan=resolved_plan, substitution=final_subst)
+    else:
+        diag = diagnose_failure(goals, actions, state, subst)
+        if depth == 0:
+            diag.max_depth_hit = True
+        return PlanResult(success=False, diagnosis=diag)
+def _backward_chain_inner(goals, actions, state, depth, subst, trace):
+    current_subst = subst
+    unsatisfied = []
+    for g in goals:
+        resolved = walk(g, current_subst)
+        result = matchesany(resolved, state, current_subst)
+        if result is not None:
+            current_subst = result
+        else:
+            unsatisfied.append(g)
+    if not unsatisfied:
+        return ([], current_subst)
+    if depth == 0:
+        return None
+    target = walk(unsatisfied[0], current_subst)
+    for action in actions:
+        fresh_action = action.fresh(nextid())
+        for eff in fresh_action.eff:
+            new_subst = unify(eff, target, current_subst.copy())
+            if new_subst is None:
+                continue
+            new_pre = apply_subst(fresh_action.pre, new_subst)
+            remaining = apply_subst(unsatisfied[1:], new_subst)
+            new_goals = new_pre + remaining
+            new_effects = set(apply_subst(fresh_action.eff, new_subst))
+            expanded_state = state | new_effects
+            result = _backward_chain_inner(new_goals, actions, expanded_state, depth - 1, new_subst, trace)
+            if result is not None:
+                sub_plan, final_subst = result
+                resolved_params = apply_subst(fresh_action.params, final_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                return (sub_plan + [step], final_subst)
+    return None
+def backward_chain_astar(
+    goals: list,
+    actions: list[Action],
+    state: set,
+) -> PlanResult:
+    counter = 0
+    def make_node(goals, subst, expanded_state, plan, g_cost):
+        nonlocal counter
+        counter += 1
+        h = 0
+        for g in goals:
+            resolved = walk(g, subst)
+            if matchesany(resolved, expanded_state, subst) is None:
+                h += 1
+        return (g_cost + h, counter, goals, subst, expanded_state, plan, g_cost)
+    start = make_node(goals, {}, state, [], 0.0)
+    frontier = [start]
+    visited = set()
+    best_unsatisfied = None
+    best_subst = {}
+    while frontier:
+        f, _, curgoals, cur_subst, cur_state, cur_plan, g = heapq.heappop(frontier)
+        remaining_subst = cur_subst
+        unsatisfied = []
+        for goal in curgoals:
+            resolved = walk(goal, remaining_subst)
+            result = matchesany(resolved, cur_state, remaining_subst)
+            if result is not None:
+                remaining_subst = result
+            else:
+                unsatisfied.append(goal)
+        # Track best attempt for diagnostics
+        if best_unsatisfied is None or len(unsatisfied) < len(best_unsatisfied):
+            best_unsatisfied = unsatisfied
+            best_subst = remaining_subst
+        if not unsatisfied:
+            resolved_plan = []
+            for name, bindings in cur_plan:
+                resolved_bindings = {k: walk(v, remaining_subst) for k, v in bindings.items()}
+                resolved_plan.append((name, resolved_bindings))
+            return PlanResult(success=True, plan=resolved_plan, substitution=remaining_subst, cost=g)
+        sig_goals = tuple(sorted(str(walk(u, remaining_subst)) for u in unsatisfied))
+        if sig_goals in visited:
+            continue
+        visited.add(sig_goals)
+        target = walk(unsatisfied[0], remaining_subst)
+        for action in actions:
+            fresh_action = action.fresh(nextid())
+            for eff in fresh_action.eff:
+                new_subst = unify(eff, target, remaining_subst.copy())
+                if new_subst is None:
+                    continue
+                new_pre = apply_subst(fresh_action.pre, new_subst)
+                remaining = apply_subst(unsatisfied[1:], new_subst)
+                new_goals = new_pre + remaining
+                new_effects = set(apply_subst(fresh_action.eff, new_subst))
+                expanded_state = cur_state | new_effects
+                resolved_params = apply_subst(fresh_action.params, new_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                new_plan = cur_plan + [step]
+                new_g = g + action.cost
+                node = make_node(new_goals, new_subst, expanded_state, new_plan, new_g)
+                heapq.heappush(frontier, node)
+    # Failed — diagnose
+    diag = diagnose_failure(goals, actions, state, best_subst)
+    return PlanResult(success=False, diagnosis=diag)
+# ─── LLM Tool Interface ──────────────────────────────────────────────
+def plan_tool(
+    goal_descriptions: list[tuple],
+    action_definitions: list[dict],
+    initial_state: list[tuple],
+    mode: str = "dfs",
+    max_depth: int = 20,
+) -> dict:
+    """
+    Entry point for LLM tool use.
+    Args:
+        goal_descriptions: list of goal tuples, e.g. [("delivered", "?who", "?where")]
+        action_definitions: list of dicts with keys:
+            name, params, preconditions, effects, cost (optional, default 1.0)
+        initial_state: list of fact tuples, e.g. [("oven_hot",), ("flour_available",)]
+        mode: "dfs" for depth-first, "astar" for cost-optimal
+        max_depth: max recursion depth for DFS (default 20)
+    Returns:
+        dict with status, plan/diagnostics, and suggestions
+    """
+    global _counter
+    _counter = 0
+    actions = []
+    for adef in action_definitions:
+        actions.append(Action(
+            name=adef["name"],
+            params=adef["params"],
+            preconditions=[tuple(p) for p in adef["preconditions"]],
+            effects=[tuple(e) for e in adef["effects"]],
+            cost=adef.get("cost", 1.0),
+        ))
+    state = {tuple(f) for f in initial_state}
+    goals = [tuple(g) for g in goal_descriptions]
+    if mode == "astar":
+        result = backward_chain_astar(goals, actions, state)
+    else:
+        result = backward_chain(goals, actions, state, depth=max_depth)
+    return result.to_dict()
+# ─── Demo ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=== Success case ===\\n")
+    actions_ok = [
+        Action("take_order", ["?c"], [("customer_called", "?c")], [("order_placed", "?c")]),
+        Action("make_dough", [], [("flour_available",)], [("dough_ready",)]),
+        Action("bake_pizza", ["?c"], [("order_placed", "?c"), ("dough_ready",), ("oven_hot",)], [("pizza_ready", "?c")]),
+        Action("deliver", ["?c", "?a"], [("pizza_ready", "?c"), ("address_known", "?c", "?a")], [("delivered", "?c", "?a")]),
+    ]
+    state_ok = {
+        ("customer_called", "Alex"),
+        ("flour_available",),
+        ("oven_hot",),
+        ("address_known", "Alex", "123 Main St"),
+    }
+    _counter = 0
+    result = backward_chain([("delivered", "?who", "?where")], actions_ok, state_ok)
+    print(result.summary())
+    print("\\n\\n=== Failure case: missing flour ===\\n")
+    state_no_flour = {
+        ("customer_called", "Alex"),
+        ("oven_hot",),
+        ("address_known", "Alex", "123 Main St"),
+    }
+    _counter = 0
+    result2 = backward_chain([("delivered", "?who", "?where")], actions_ok, state_no_flour)
+    print(result2.summary())
+    print("\\n\\n=== Failure case: no action produces goal ===\\n")
+    _counter = 0
+    result3 = backward_chain([("teleported", "?who")], actions_ok, state_ok)
+    print(result3.summary())
+    print("\\n\\n=== LLM tool interface ===\\n")
+    tool_result = plan_tool(
+        goal_descriptions=[("delivered", "?who", "?where")],
+        action_definitions=[
+            {"name": "take_order", "params": ["?c"],
+             "preconditions": [["customer_called", "?c"]],
+             "effects": [["order_placed", "?c"]]},
+            {"name": "make_dough", "params": [],
+             "preconditions": [["flour_available"]],
+             "effects": [["dough_ready"]]},
+            {"name": "bake_pizza", "params": ["?c"],
+             "preconditions": [["order_placed", "?c"], ["dough_ready"], ["oven_hot"]],
+             "effects": [["pizza_ready", "?c"]]},
+            {"name": "deliver", "params": ["?c", "?a"],
+             "preconditions": [["pizza_ready", "?c"], ["address_known", "?c", "?a"]],
+             "effects": [["delivered", "?c", "?a"]]},
+        ],
+        initial_state=[
+            ["customer_called", "Alex"],
+            ["flour_available"],
+            ["oven_hot"],
+            ["address_known", "Alex", "123 Main St"],
+        ],
+        mode="dfs",
+    )
+    import json
+    print(json.dumps(tool_result, indent=2))
