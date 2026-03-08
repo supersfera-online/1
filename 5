@@ -1,0 +1,753 @@
+
+#!/usr/bin/env python3
+"""
+Backward Chaining Planner v2 with Unification (Prolog/PDDL style)
+Features:
+  - Variable unification (?x, ?y, etc.)
+  - Backward chaining search (DFS with depth limit)
+  - A* cost-optimal search
+  - DELETE effects (actions can remove facts from state)
+  - HTN decomposition (hierarchical tasks -> subtasks)
+  - Diagnostic feedback on failed plans
+  - Interactive demo mode
+Usage:
+  python planner.py          # run all demos
+  python planner.py --inter  # interactive mode
+Compatible with Python 3.8+
+"""
+
+import heapq
+import sys
+import json
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple, Set, Any
+
+# ================================================================
+# Unification Engine
+# ================================================================
+
+def is_var(term):
+    return isinstance(term, str) and term.startswith("?")
+
+def walk(term, subst):
+    seen = set()
+    while is_var(term) and term in subst and term not in seen:
+        seen.add(term)
+        term = subst[term]
+    if isinstance(term, tuple):
+        return tuple(walk(t, subst) for t in term)
+    if isinstance(term, list):
+        return [walk(t, subst) for t in term]
+    return term
+
+def unify(t1, t2, subst):
+    t1 = walk(t1, subst)
+    t2 = walk(t2, subst)
+    if t1 == t2:
+        return subst
+    if is_var(t1):
+        return {**subst, t1: t2}
+    if is_var(t2):
+        return {**subst, t2: t1}
+    if isinstance(t1, (tuple, list)) and isinstance(t2, (tuple, list)):
+        if len(t1) != len(t2):
+            return None
+        for a, b in zip(t1, t2):
+            subst = unify(a, b, subst)
+            if subst is None:
+                return None
+        return subst
+    return None
+
+def apply_subst(predicates, subst):
+    return [walk(p, subst) for p in predicates]
+
+# ================================================================
+# Action with Delete Effects
+# ================================================================
+
+class Action:
+    """
+    A planning action with add AND delete effects.
+    Args:
+        name:           action name
+        params:         list of variable names ["?x", "?y"]
+        preconditions:  facts that must hold before execution
+        effects:        facts ADDED after execution (add list)
+        delete_effects: facts REMOVED after execution (delete list)
+        cost:           numeric cost for A* planning
+    """
+    def __init__(self, name, params, preconditions, effects,
+                 delete_effects=None, cost=1.0):
+        self.name = name
+        self.params = params
+        self.pre = preconditions
+        self.eff = effects
+        self.delete_eff = delete_effects or []
+        self.cost = cost
+
+    def fresh(self, counter):
+        rename = {p: p + "_" + str(counter) for p in self.params}
+        return Action(
+            self.name,
+            [rename[p] for p in self.params],
+            apply_subst(self.pre, rename),
+            apply_subst(self.eff, rename),
+            apply_subst(self.delete_eff, rename),
+            self.cost,
+        )
+
+    def __repr__(self):
+        args = ", ".join(self.params)
+        return "Action(%s(%s))" % (self.name, args)
+
+# ================================================================
+# HTN Method (Hierarchical Task Network)
+# ================================================================
+
+class Method:
+    """
+    An HTN decomposition method.
+    A Method says: to achieve task T, you can decompose it into
+    subtasks [S1, S2, ...] if preconditions are met.
+    Args:
+        name:           method name
+        task:           the abstract task this method decomposes,
+                        e.g. ("deliver_order", "?customer")
+        params:         variables used, e.g. ["?customer", "?addr"]
+        preconditions:  conditions to check before decomposing
+        subtasks:       ordered list of subtasks (can be abstract or primitive)
+    """
+    def __init__(self, name, task, params, preconditions, subtasks):
+        self.name = name
+        self.task = task
+        self.params = params
+        self.pre = preconditions
+        self.subtasks = subtasks
+
+    def fresh(self, counter):
+        rename = {p: p + "_" + str(counter) for p in self.params}
+        return Method(
+            self.name,
+            walk(self.task, rename),
+            [rename.get(p, p) for p in self.params],
+            apply_subst(self.pre, rename),
+            apply_subst(self.subtasks, rename),
+        )
+
+    def __repr__(self):
+        return "Method(%s)" % self.name
+
+# ================================================================
+# Diagnostics
+# ================================================================
+
+@dataclass
+class Diagnosis:
+    unsatisfied_goals: list = field(default_factory=list)
+    failed_preconditions: list = field(default_factory=list)
+    actions_tried: list = field(default_factory=list)
+    suggestions: list = field(default_factory=list)
+    max_depth_hit: bool = False
+
+    def summary(self):
+        lines = ["=== PLAN FAILED ==="]
+        if self.max_depth_hit:
+            lines.append("")
+            lines.append("! Search depth limit reached.")
+        if self.unsatisfied_goals:
+            lines.append("")
+            lines.append("Unsatisfied goals:")
+            for g in self.unsatisfied_goals:
+                lines.append("  - %s" % str(g))
+        if self.failed_preconditions:
+            lines.append("")
+            lines.append("Failed preconditions:")
+            for a, p in self.failed_preconditions:
+                lines.append("  - %s requires: %s" % (a, str(p)))
+        if self.suggestions:
+            lines.append("")
+            lines.append("Suggestions:")
+            for s in self.suggestions:
+                lines.append("  - %s" % s)
+        return "\n".join(lines)
+
+@dataclass
+class PlanResult:
+    success: bool
+    plan: list = field(default_factory=list)
+    substitution: dict = field(default_factory=dict)
+    cost: float = 0.0
+    diagnosis: Any = None
+
+    def summary(self):
+        if self.success:
+            lines = ["=== PLAN FOUND ==="]
+            if self.cost > 0:
+                lines.append("Total cost: %s" % self.cost)
+            for i, (name, bindings) in enumerate(self.plan, 1):
+                bound = {k: v for k, v in bindings.items() if not is_var(v)}
+                if bound:
+                    args = ", ".join("%s=%s" % (k, v) for k, v in bound.items())
+                    lines.append("  %d. %s(%s)" % (i, name, args))
+                else:
+                    lines.append("  %d. %s()" % (i, name))
+            return "\n".join(lines)
+        if self.diagnosis:
+            return self.diagnosis.summary()
+        return "No plan found."
+
+    def to_dict(self):
+        if self.success:
+            return {
+                "status": "success",
+                "plan": [
+                    {"step": i, "action": name,
+                     "bindings": {k: str(v) for k, v in bindings.items() if not is_var(v)}}
+                    for i, (name, bindings) in enumerate(self.plan, 1)
+                ],
+                "cost": self.cost,
+            }
+        d = self.diagnosis
+        return {
+            "status": "failure",
+            "unsatisfied_goals": [str(g) for g in (d.unsatisfied_goals if d else [])],
+            "failed_preconditions": [
+                {"action": a, "requires": str(p)}
+                for a, p in (d.failed_preconditions if d else [])
+            ],
+            "suggestions": d.suggestions if d else [],
+        }
+
+# ================================================================
+# Diagnostic Analyzer
+# ================================================================
+
+def diagnose_failure(goals, actions, state, subst=None):
+    if subst is None:
+        subst = {}
+    diag = Diagnosis()
+    for g in goals:
+        resolved = walk(g, subst)
+        if matchesany(resolved, state, subst) is None:
+            diag.unsatisfied_goals.append(resolved)
+    for goal in diag.unsatisfied_goals:
+        for action in actions:
+            for eff in action.eff:
+                test_subst = unify(eff, goal, subst.copy())
+                if test_subst is not None:
+                    diag.actions_tried.append(action.name)
+                    for pre in action.pre:
+                        resolved_pre = walk(pre, test_subst)
+                        if matchesany(resolved_pre, state, test_subst) is None:
+                            diag.failed_preconditions.append((action.name, resolved_pre))
+                    break
+    all_effects = set()
+    for action in actions:
+        for eff in action.eff:
+            if isinstance(eff, tuple) and len(eff) > 0:
+                all_effects.add(eff[0])
+    for goal in diag.unsatisfied_goals:
+        pred = goal[0] if isinstance(goal, tuple) and len(goal) > 0 else str(goal)
+        producers = [a.name for a in actions
+                     if any(isinstance(e, tuple) and len(e) > 0 and e[0] == pred for e in a.eff)]
+        if not producers:
+            diag.suggestions.append("No action produces '%s'. Define one." % pred)
+        else:
+            diag.suggestions.append(
+                "Goal %s producible by: %s. Check preconditions/state."
+                % (str(goal), ", ".join(producers)))
+    for aname, pre in diag.failed_preconditions:
+        pp = pre[0] if isinstance(pre, tuple) and len(pre) > 0 else str(pre)
+        if pp not in all_effects:
+            diag.suggestions.append(
+                "'%s' needed by '%s' not produced by any action. Add to state."
+                % (str(pre), aname))
+    diag.actions_tried = list(dict.fromkeys(diag.actions_tried))
+    diag.suggestions = list(dict.fromkeys(diag.suggestions))
+    return diag
+
+# ================================================================
+# State with Delete Effects
+# ================================================================
+
+def apply_action_effects(state, action, subst):
+    """Apply add and delete effects of an action to state."""
+    new_state = set(state)
+    for d in action.delete_eff:
+        resolved = walk(d, subst)
+        new_state.discard(resolved)
+    for a in action.eff:
+        resolved = walk(a, subst)
+        new_state.add(resolved)
+    return new_state
+
+# ================================================================
+# Core Planner (with delete effects)
+# ================================================================
+
+_counter = 0
+
+def nextid():
+    global _counter
+    _counter += 1
+    return _counter
+
+def matchesany(goal, state, subst):
+    for fact in state:
+        result = unify(goal, fact, subst)
+        if result is not None:
+            return result
+    return None
+
+def _bc_inner(goals, actions, state, depth, subst):
+    current_subst = subst
+    unsatisfied = []
+    for g in goals:
+        resolved = walk(g, current_subst)
+        result = matchesany(resolved, state, current_subst)
+        if result is not None:
+            current_subst = result
+        else:
+            unsatisfied.append(g)
+    if not unsatisfied:
+        return ([], current_subst, state)
+    if depth == 0:
+        return None
+    target = walk(unsatisfied[0], current_subst)
+    for action in actions:
+        fa = action.fresh(nextid())
+        for eff in fa.eff:
+            ns = unify(eff, target, current_subst.copy())
+            if ns is None:
+                continue
+            new_pre = apply_subst(fa.pre, ns)
+            remaining = apply_subst(unsatisfied[1:], ns)
+            new_state = apply_action_effects(state, fa, ns)
+            result = _bc_inner(new_pre + remaining, actions, new_state, depth - 1, ns)
+            if result is not None:
+                sub_plan, final_subst, final_state = result
+                rp = apply_subst(fa.params, final_subst)
+                step = (fa.name, dict(zip(action.params, rp)))
+                return (sub_plan + [step], final_subst, final_state)
+    return None
+
+def backward_chain(goals, actions, state, depth=20, subst=None):
+    if subst is None:
+        subst = {}
+    result = _bc_inner(goals, actions, state, depth, subst)
+    if result is not None:
+        plan, fs, final_state = result
+        rp = [(n, {k: walk(v, fs) for k, v in b.items()}) for n, b in plan]
+        return PlanResult(success=True, plan=rp, substitution=fs)
+    diag = diagnose_failure(goals, actions, state, subst)
+    return PlanResult(success=False, diagnosis=diag)
+
+def backward_chain_astar(goals, actions, state):
+    ctr = [0]
+    def make_node(gs, subst, exp_state, plan, g_cost):
+        ctr[0] += 1
+        h = sum(1 for g in gs if matchesany(walk(g, subst), exp_state, subst) is None)
+        return (g_cost + h, ctr[0], gs, subst, exp_state, plan, g_cost)
+    frontier = [make_node(goals, {}, state, [], 0.0)]
+    visited = set()
+    best_unsat, best_subst = None, {}
+    while frontier:
+        f, _, cg, cs, cstate, cplan, g = heapq.heappop(frontier)
+        rs = cs
+        unsat = []
+        for goal in cg:
+            res = matchesany(walk(goal, rs), cstate, rs)
+            if res is not None:
+                rs = res
+            else:
+                unsat.append(goal)
+        if best_unsat is None or len(unsat) < len(best_unsat):
+            best_unsat, best_subst = unsat, rs
+        if not unsat:
+            rp = [(n, {k: walk(v, rs) for k, v in b.items()}) for n, b in cplan]
+            return PlanResult(success=True, plan=rp, substitution=rs, cost=g)
+        sig = tuple(sorted(str(walk(u, rs)) for u in unsat))
+        if sig in visited:
+            continue
+        visited.add(sig)
+        target = walk(unsat[0], rs)
+        for action in actions:
+            fa = action.fresh(nextid())
+            for eff in fa.eff:
+                ns = unify(eff, target, rs.copy())
+                if ns is None:
+                    continue
+                np2 = apply_subst(fa.pre, ns)
+                rem = apply_subst(unsat[1:], ns)
+                new_state = apply_action_effects(cstate, fa, ns)
+                rparms = apply_subst(fa.params, ns)
+                step = (fa.name, dict(zip(action.params, rparms)))
+                node = make_node(np2 + rem, ns, new_state, cplan + [step], g + action.cost)
+                heapq.heappush(frontier, node)
+    diag = diagnose_failure(goals, actions, state, best_subst)
+    return PlanResult(success=False, diagnosis=diag)
+
+# ================================================================
+# HTN Planner
+# ================================================================
+
+def htn_plan(tasks, actions, methods, state, depth=30, subst=None):
+    """
+    HTN planner: decomposes abstract tasks into primitive actions.
+    Args:
+        tasks:   ordered list of tasks (abstract or primitive goals)
+        actions: list of primitive Action objects
+        methods: list of Method objects for decomposing abstract tasks
+        state:   set of fact tuples (initial state)
+        depth:   max decomposition depth
+        subst:   initial variable bindings
+    Returns:
+        PlanResult with the fully decomposed plan
+    """
+    if subst is None:
+        subst = {}
+    result = _htn_inner(tasks, actions, methods, state, depth, subst)
+    if result is not None:
+        plan, fs, final_state = result
+        rp = [(n, {k: walk(v, fs) for k, v in b.items()}) for n, b in plan]
+        return PlanResult(success=True, plan=rp, substitution=fs)
+    diag = Diagnosis()
+    for t in tasks:
+        resolved = walk(t, subst)
+        diag.unsatisfied_goals.append(resolved)
+    diag.suggestions.append("HTN decomposition failed. Check methods cover all abstract tasks.")
+    return PlanResult(success=False, diagnosis=diag)
+
+def _htn_inner(tasks, actions, methods, state, depth, subst):
+    if not tasks:
+        return ([], subst, state)
+    if depth == 0:
+        return None
+
+    current_task = walk(tasks[0], subst)
+    remaining_tasks = tasks[1:]
+
+    # Try as primitive: find an action whose effect matches this task
+    for action in actions:
+        fa = action.fresh(nextid())
+        for eff in fa.eff:
+            ns = unify(eff, current_task, subst.copy())
+            if ns is None:
+                continue
+            pre_ok = True
+            temp_subst = ns
+            for pre in fa.pre:
+                resolved_pre = walk(pre, temp_subst)
+                match = matchesany(resolved_pre, state, temp_subst)
+                if match is None:
+                    pre_ok = False
+                    break
+                temp_subst = match
+            if not pre_ok:
+                continue
+            new_state = apply_action_effects(state, fa, temp_subst)
+            rp = apply_subst(fa.params, temp_subst)
+            step = (fa.name, dict(zip(action.params, rp)))
+            rest = _htn_inner(
+                apply_subst(remaining_tasks, temp_subst),
+                actions, methods, new_state, depth - 1, temp_subst
+            )
+            if rest is not None:
+                rest_plan, final_subst, final_state = rest
+                return ([step] + rest_plan, final_subst, final_state)
+
+    # Try as abstract: find a method that decomposes this task
+    for method in methods:
+        fm = method.fresh(nextid())
+        ns = unify(fm.task, current_task, subst.copy())
+        if ns is None:
+            continue
+        pre_ok = True
+        temp_subst = ns
+        for pre in fm.pre:
+            resolved_pre = walk(pre, temp_subst)
+            match = matchesany(resolved_pre, state, temp_subst)
+            if match is None:
+                pre_ok = False
+                break
+            temp_subst = match
+        if not pre_ok:
+            continue
+        expanded = apply_subst(fm.subtasks, temp_subst) + apply_subst(remaining_tasks, temp_subst)
+        result = _htn_inner(expanded, actions, methods, state, depth - 1, temp_subst)
+        if result is not None:
+            return result
+
+    return None
+
+# ================================================================
+# LLM Tool Interface
+# ================================================================
+
+def plan_tool(goal_descriptions, action_definitions, initial_state,
+              mode="dfs", max_depth=20, method_definitions=None):
+    """
+    Entry point for LLM tool use. Accepts JSON-friendly arguments.
+    Args:
+        goal_descriptions:  list of goal lists
+        action_definitions: list of dicts (name, params, preconditions, effects, delete_effects, cost)
+        initial_state:      list of fact lists
+        mode:               "dfs", "astar", or "htn"
+        max_depth:          max depth (default 20)
+        method_definitions: list of method dicts for HTN mode
+    Returns:
+        dict with status, plan or diagnostics
+    """
+    global _counter
+    _counter = 0
+    actions = []
+    for adef in action_definitions:
+        actions.append(Action(
+            name=adef["name"],
+            params=adef.get("params", []),
+            preconditions=[tuple(p) for p in adef["preconditions"]],
+            effects=[tuple(e) for e in adef["effects"]],
+            delete_effects=[tuple(d) for d in adef.get("delete_effects", [])],
+            cost=adef.get("cost", 1.0),
+        ))
+    state = {tuple(f) for f in initial_state}
+    goals = [tuple(g) for g in goal_descriptions]
+
+    if mode == "htn" and method_definitions:
+        methods = []
+        for mdef in method_definitions:
+            methods.append(Method(
+                name=mdef["name"],
+                task=tuple(mdef["task"]),
+                params=mdef.get("params", []),
+                preconditions=[tuple(p) for p in mdef.get("preconditions", [])],
+                subtasks=[tuple(s) for s in mdef["subtasks"]],
+            ))
+        return htn_plan(goals, actions, methods, state, max_depth).to_dict()
+    elif mode == "astar":
+        return backward_chain_astar(goals, actions, state).to_dict()
+    else:
+        return backward_chain(goals, actions, state, depth=max_depth).to_dict()
+
+# ================================================================
+# Demo Scenarios
+# ================================================================
+
+def run_all_demos():
+    global _counter
+
+    print("=== Demo 1: Build Pipeline (ground terms) ===")
+    _counter = 0
+    r = backward_chain(
+        [("test_passed",)],
+        [Action("compile", [], [("have_source",)], [("have_executable",)]),
+         Action("link", [], [("have_executable",), ("have_lib",)], [("have_binary",)]),
+         Action("run_test", [], [("have_binary",)], [("test_passed",)])],
+        {("have_source",), ("have_lib",)})
+    print(r.summary())
+    print()
+
+    print("=== Demo 2: Download-Compile-Link-Test (variables) ===")
+    _counter = 0
+    r = backward_chain(
+        [("tested", "?target")],
+        [Action("download", ["?url","?file"], [("known_url","?url")], [("downloaded","?file")]),
+         Action("compile", ["?src","?obj"], [("downloaded","?src"),("compiler_ready",)], [("compiled","?obj")]),
+         Action("link", ["?obj","?bin"], [("compiled","?obj"),("linker_ready",)], [("linked","?bin")]),
+         Action("test", ["?bin"], [("linked","?bin")], [("tested","?bin")])],
+        {("known_url","https://repo/src.tar"),("compiler_ready",),("linker_ready",)})
+    print(r.summary())
+    print()
+
+    print("=== Demo 3: Pizza Delivery (FAILURE - no flour) ===")
+    _counter = 0
+    r = backward_chain(
+        [("delivered", "?who", "?where")],
+        [Action("take_order",["?c"],[("customer_called","?c")],[("order_placed","?c")]),
+         Action("make_dough",[],[("flour_available",)],[("dough_ready",)]),
+         Action("bake",["?c"],[("order_placed","?c"),("dough_ready",),("oven_hot",)],[("pizza_ready","?c")]),
+         Action("deliver",["?c","?a"],[("pizza_ready","?c"),("address_known","?c","?a")],[("delivered","?c","?a")])],
+        {("customer_called","Alex"),("oven_hot",),("address_known","Alex","Main St")})
+    print(r.summary())
+    print()
+
+    print("=== Demo 4: A* Cost-Optimal Compilation ===")
+    _counter = 0
+    r = backward_chain_astar(
+        [("tested", "?out")],
+        [Action("fast_compile",["?src","?bin"],[("source_ready","?src")],[("executable","?bin")],cost=1),
+         Action("opt_compile",["?src","?bin"],[("source_ready","?src"),("opt_flags",)],[("executable","?bin"),("optimized","?bin")],cost=5),
+         Action("quick_test",["?bin"],[("executable","?bin")],[("tested","?bin")],cost=1),
+         Action("full_test",["?bin"],[("executable","?bin"),("test_env",)],[("tested","?bin"),("coverage",)],cost=10)],
+        {("source_ready","main.rs")})
+    print(r.summary())
+    print()
+
+    print("=== Demo 5: DELETE Effects (robot moves box between rooms) ===")
+    _counter = 0
+    actions_del = [
+        Action("pick_up", ["?obj", "?loc"],
+               preconditions=[("at_robot", "?loc"), ("at_obj", "?obj", "?loc"), ("hand_empty",)],
+               effects=[("holding", "?obj")],
+               delete_effects=[("at_obj", "?obj", "?loc"), ("hand_empty",)]),
+        Action("put_down", ["?obj", "?loc"],
+               preconditions=[("at_robot", "?loc"), ("holding", "?obj")],
+               effects=[("at_obj", "?obj", "?loc"), ("hand_empty",)],
+               delete_effects=[("holding", "?obj")]),
+        Action("move", ["?from", "?to"],
+               preconditions=[("at_robot", "?from"), ("connected", "?from", "?to")],
+               effects=[("at_robot", "?to")],
+               delete_effects=[("at_robot", "?from")]),
+    ]
+    methods_del = [
+        Method("transport_obj",
+               task=("transport", "?obj", "?from", "?to"),
+               params=["?obj", "?from", "?to"],
+               preconditions=[("at_robot", "?from"), ("at_obj", "?obj", "?from")],
+               subtasks=[
+                   ("holding", "?obj"),
+                   ("at_robot", "?to"),
+                   ("at_obj", "?obj", "?to"),
+               ]),
+    ]
+    state_del = {
+        ("at_robot", "room_a"),
+        ("at_obj", "box", "room_a"),
+        ("hand_empty",),
+        ("connected", "room_a", "room_b"),
+        ("connected", "room_b", "room_a"),
+    }
+    r = htn_plan(
+        [("transport", "box", "room_a", "room_b")],
+        actions_del, methods_del, state_del)
+    print(r.summary())
+    print()
+
+    print("=== Demo 6: HTN - Travel Planning ===")
+    _counter = 0
+    actions_htn = [
+        Action("call_taxi", ["?from"],
+               preconditions=[("at", "?from"), ("has_phone",)],
+               effects=[("taxi_at", "?from")]),
+        Action("ride_taxi", ["?from", "?to"],
+               preconditions=[("at", "?from"), ("taxi_at", "?from")],
+               effects=[("at", "?to")],
+               delete_effects=[("at", "?from"), ("taxi_at", "?from")]),
+        Action("walk_to", ["?from", "?to"],
+               preconditions=[("at", "?from"), ("walkable", "?from", "?to")],
+               effects=[("at", "?to")],
+               delete_effects=[("at", "?from")]),
+        Action("buy_ticket", ["?dest"],
+               preconditions=[("at", "airport"), ("has_money",)],
+               effects=[("has_ticket", "?dest")],
+               delete_effects=[("has_money",)]),
+        Action("fly", ["?dest"],
+               preconditions=[("at", "airport"), ("has_ticket", "?dest")],
+               effects=[("at", "?dest")],
+               delete_effects=[("at", "airport"), ("has_ticket", "?dest")]),
+    ]
+    methods_htn = [
+        Method("travel_by_taxi",
+               task=("travel", "?from", "?to"),
+               params=["?from", "?to"],
+               preconditions=[("has_phone",)],
+               subtasks=[("taxi_at", "?from"), ("at", "?to")]),
+        Method("travel_by_air",
+               task=("travel", "?from", "?to"),
+               params=["?from", "?to"],
+               preconditions=[("walkable", "?from", "airport"), ("has_money",)],
+               subtasks=[("at", "airport"), ("has_ticket", "?to"), ("at", "?to")]),
+    ]
+    state_htn = {
+        ("at", "home"),
+        ("has_phone",),
+        ("has_money",),
+        ("walkable", "home", "airport"),
+    }
+    r = htn_plan(
+        [("travel", "home", "paris")],
+        actions_htn, methods_htn, state_htn)
+    print(r.summary())
+    print()
+
+    print("=== Demo 7: HTN - Restaurant Order ===")
+    _counter = 0
+    actions_rest = [
+        Action("take_order", ["?c"],
+               [("seated", "?c")],
+               [("order_taken", "?c")]),
+        Action("cook_dish", ["?c"],
+               [("order_taken", "?c"), ("ingredients_ready",)],
+               [("dish_ready", "?c")],
+               [("ingredients_ready",)]),
+        Action("prep_ingredients", [],
+               [("kitchen_open",)],
+               [("ingredients_ready",)]),
+        Action("serve_dish", ["?c"],
+               [("dish_ready", "?c")],
+               [("served", "?c")],
+               [("dish_ready", "?c")]),
+        Action("collect_payment", ["?c"],
+               [("served", "?c")],
+               [("paid", "?c")]),
+    ]
+    methods_rest = [
+        Method("full_service",
+               task=("fulfill_order", "?c"),
+               params=["?c"],
+               preconditions=[("seated", "?c")],
+               subtasks=[
+                   ("order_taken", "?c"),
+                   ("ingredients_ready",),
+                   ("dish_ready", "?c"),
+                   ("served", "?c"),
+                   ("paid", "?c"),
+               ]),
+    ]
+    state_rest = {("seated", "Bob"), ("kitchen_open",)}
+    r = htn_plan(
+        [("fulfill_order", "Bob")],
+        actions_rest, methods_rest, state_rest)
+    print(r.summary())
+
+if __name__ == "__main__":
+    if "--inter" in sys.argv or "-i" in sys.argv:
+        print("=" * 50)
+        print("  Backward Chaining Planner v2 - Interactive")
+        print("=" * 50)
+        print("  Type 'run' to run all demos")
+        print("  Type 'json' to input a JSON scenario")
+        print("  Type 'quit' to exit")
+        while True:
+            choice = input("\n> ").strip().lower()
+            if choice in ("q", "quit", "exit"):
+                break
+            elif choice == "run":
+                run_all_demos()
+            elif choice == "json":
+                print("Paste JSON, then empty line:")
+                lines = []
+                while True:
+                    line = input()
+                    if line.strip() == "":
+                        break
+                    lines.append(line)
+                try:
+                    data = json.loads("\n".join(lines))
+                    r = plan_tool(
+                        data["goals"], data["actions"], data["state"],
+                        data.get("mode", "dfs"), data.get("max_depth", 20),
+                        data.get("methods"))
+                    print(json.dumps(r, indent=2))
+                except Exception as e:
+                    print("Error: %s" % e)
+    elif "--json" in sys.argv:
+        data = json.load(sys.stdin)
+        r = plan_tool(
+            data["goals"], data["actions"], data["state"],
+            data.get("mode", "dfs"), data.get("max_depth", 20),
+            data.get("methods"))
+        print(json.dumps(r, indent=2))
+    else:
+        run_all_demos()
