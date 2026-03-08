@@ -1,0 +1,347 @@
+"""
+Backward Chaining Planner with Unification (Prolog/PDDL style)
+
+Supports:
+- Variable unification (?x, ?y, etc.)
+- Partial effect matching (action needs at least one relevant effect)
+- Substitution propagation through the plan
+- Cumulative state tracking (effects of planned actions enrich the state)
+- A* search mode with action costs and heuristic guidance
+"""
+
+import heapq
+from typing import Optional
+
+
+def is_var(term) -> bool:
+    return isinstance(term, str) and term.startswith("?")
+
+
+def walk(term, subst: dict):
+    seen = set()
+    while is_var(term) and term in subst and term not in seen:
+        seen.add(term)
+        term = subst[term]
+    if isinstance(term, tuple):
+        return tuple(walk(t, subst) for t in term)
+    if isinstance(term, list):
+        return [walk(t, subst) for t in term]
+    return term
+
+
+def unify(t1, t2, subst: dict) -> Optional[dict]:
+    t1 = walk(t1, subst)
+    t2 = walk(t2, subst)
+    if t1 == t2:
+        return subst
+    if is_var(t1):
+        return {**subst, t1: t2}
+    if is_var(t2):
+        return {**subst, t2: t1}
+    if isinstance(t1, (tuple, list)) and isinstance(t2, (tuple, list)):
+        if len(t1) != len(t2):
+            return None
+        for a, b in zip(t1, t2):
+            subst = unify(a, b, subst)
+            if subst is None:
+                return None
+        return subst
+    return None
+
+
+def apply_subst(predicates: list, subst: dict) -> list:
+    return [walk(p, subst) for p in predicates]
+
+
+class Action:
+    def __init__(self, name: str, params: list, preconditions: list, effects: list, cost: float = 1.0):
+        self.name = name
+        self.params = params
+        self.pre = preconditions
+        self.eff = effects
+        self.cost = cost
+
+    def fresh(self, counter: int) -> "Action":
+        rename = {p: f"{p}_{counter}" for p in self.params}
+        a = Action(
+            self.name,
+            [rename[p] for p in self.params],
+            apply_subst(self.pre, rename),
+            apply_subst(self.eff, rename),
+            self.cost,
+        )
+        return a
+
+
+_counter = 0
+
+
+def _next_id():
+    global _counter
+    _counter += 1
+    return _counter
+
+
+def _matches_any(goal, state, subst):
+    for fact in state:
+        result = unify(goal, fact, subst)
+        if result is not None:
+            return result
+    return None
+
+
+def backward_chain(
+    goals: list,
+    actions: list[Action],
+    state: set,
+    depth: int = 20,
+    subst: dict | None = None,
+) -> Optional[tuple[list[tuple[str, dict]], dict]]:
+    if subst is None:
+        subst = {}
+
+    current_subst = subst
+    unsatisfied = []
+    for g in goals:
+        resolved = walk(g, current_subst)
+        result = _matches_any(resolved, state, current_subst)
+        if result is not None:
+            current_subst = result
+        else:
+            unsatisfied.append(g)
+
+    if not unsatisfied:
+        return ([], current_subst)
+
+    if depth == 0:
+        return None
+
+    target = walk(unsatisfied[0], current_subst)
+
+    for action in actions:
+        fresh_action = action.fresh(_next_id())
+
+        for eff in fresh_action.eff:
+            new_subst = unify(eff, target, current_subst.copy())
+            if new_subst is None:
+                continue
+
+            new_pre = apply_subst(fresh_action.pre, new_subst)
+            remaining = apply_subst(unsatisfied[1:], new_subst)
+            new_goals = new_pre + remaining
+
+            new_effects = set(apply_subst(fresh_action.eff, new_subst))
+            expanded_state = state | new_effects
+
+            result = backward_chain(new_goals, actions, expanded_state, depth - 1, new_subst)
+            if result is not None:
+                sub_plan, final_subst = result
+                resolved_params = apply_subst(fresh_action.params, final_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                return (sub_plan + [step], final_subst)
+
+    return None
+
+
+def backward_chain_astar(
+    goals: list,
+    actions: list[Action],
+    state: set,
+) -> Optional[tuple[list[tuple[str, dict]], dict, float]]:
+    counter = 0
+
+    def make_node(goals, subst, expanded_state, plan, g_cost):
+        nonlocal counter
+        counter += 1
+        h = 0
+        for g in goals:
+            resolved = walk(g, subst)
+            if _matches_any(resolved, expanded_state, subst) is None:
+                h += 1
+        return (g_cost + h, counter, goals, subst, expanded_state, plan, g_cost)
+
+    start = make_node(goals, {}, state, [], 0.0)
+    frontier = [start]
+    visited = set()
+
+    while frontier:
+        f, _, cur_goals, cur_subst, cur_state, cur_plan, g = heapq.heappop(frontier)
+
+        remaining_subst = cur_subst
+        unsatisfied = []
+        for goal in cur_goals:
+            resolved = walk(goal, remaining_subst)
+            result = _matches_any(resolved, cur_state, remaining_subst)
+            if result is not None:
+                remaining_subst = result
+            else:
+                unsatisfied.append(goal)
+
+        if not unsatisfied:
+            return (cur_plan, remaining_subst, g)
+
+        sig_goals = tuple(sorted(str(walk(u, remaining_subst)) for u in unsatisfied))
+        if sig_goals in visited:
+            continue
+        visited.add(sig_goals)
+
+        target = walk(unsatisfied[0], remaining_subst)
+
+        for action in actions:
+            fresh_action = action.fresh(_next_id())
+
+            for eff in fresh_action.eff:
+                new_subst = unify(eff, target, remaining_subst.copy())
+                if new_subst is None:
+                    continue
+
+                new_pre = apply_subst(fresh_action.pre, new_subst)
+                remaining = apply_subst(unsatisfied[1:], new_subst)
+                new_goals = new_pre + remaining
+
+                new_effects = set(apply_subst(fresh_action.eff, new_subst))
+                expanded_state = cur_state | new_effects
+
+                resolved_params = apply_subst(fresh_action.params, new_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                new_plan = cur_plan + [step]
+                new_g = g + action.cost
+
+                node = make_node(new_goals, new_subst, expanded_state, new_plan, new_g)
+                heapq.heappush(frontier, node)
+
+    return None
+
+
+def format_plan(plan: list[tuple[str, dict]], subst: dict | None = None) -> None:
+    for i, (name, bindings) in enumerate(plan, 1):
+        if subst:
+            bindings = {k: walk(v, subst) for k, v in bindings.items()}
+        bound = {k: v for k, v in bindings.items() if not is_var(v)}
+        if bound:
+            args = ", ".join(f"{k}={v}" for k, v in bound.items())
+            print(f"  {i}. {name}({args})")
+        else:
+            print(f"  {i}. {name}()")
+
+
+if __name__ == "__main__":
+    print("=== Example 1: Ground terms ===")
+
+    actions_ground = [
+        Action("compile_tensor", [], [("have_source",)], [("have_executable",)]),
+        Action("link_pjrt",      [], [("have_executable",), ("have_lib",)], [("have_binary",)]),
+        Action("run_test",        [], [("have_binary",)], [("test_passed",)]),
+    ]
+
+    state1 = {("have_source",), ("have_lib",)}
+    result1 = backward_chain([("test_passed",)], actions_ground, state1)
+
+    if result1:
+        print("Plan found:")
+        format_plan(result1[0], result1[1])
+    else:
+        print("No plan found")
+
+    print("\n=== Example 2: Variables & unification ===")
+
+    actions_var = [
+        Action("download", ["?url", "?file"], [("known_url", "?url")], [("downloaded", "?file")]),
+        Action("compile",  ["?src", "?obj"],  [("downloaded", "?src"), ("compiler_ready",)], [("compiled", "?obj")]),
+        Action("link",     ["?obj", "?bin"],  [("compiled", "?obj"), ("linker_ready",)], [("linked", "?bin")]),
+        Action("test",     ["?bin"],          [("linked", "?bin")], [("tested", "?bin")]),
+    ]
+
+    state2 = {
+        ("known_url", "https://repo/src.tar"),
+        ("compiler_ready",),
+        ("linker_ready",),
+    }
+
+    _counter = 0
+    result2 = backward_chain([("tested", "?target")], actions_var, state2)
+
+    if result2:
+        plan2, subst2 = result2
+        print(f"Plan found (target = {walk('?target', subst2)}):")
+        format_plan(plan2, subst2)
+    else:
+        print("No plan found")
+
+    print("\n=== Example 3: Multiple goals ===")
+
+    actions_multi = [
+        Action("fetch_data",   ["?src"], [("url_known", "?src")], [("data_ready", "?src")]),
+        Action("train_model",  ["?d"],   [("data_ready", "?d")],  [("model_trained",)]),
+        Action("write_report", ["?d"],   [("data_ready", "?d")],  [("report_done",)]),
+    ]
+
+    state3 = {("url_known", "dataset_v2")}
+
+    _counter = 0
+    result3 = backward_chain([("model_trained",), ("report_done",)], actions_multi, state3)
+
+    if result3:
+        print("Plan found:")
+        format_plan(result3[0], result3[1])
+    else:
+        print("No plan found")
+
+    print("\n=== Example 4: Build pipeline with config ===")
+
+    actions_build = [
+        Action("detect_gpu",   ["?arch"],           [("system_ready",)], [("gpu_detected", "?arch")]),
+        Action("fetch_pjrt",   ["?arch", "?plugin"], [("gpu_detected", "?arch")], [("pjrt_ready", "?plugin")]),
+        Action("build_bridge", ["?plugin", "?bridge"], [("pjrt_ready", "?plugin"), ("rust_toolchain",)], [("bridge_built", "?bridge")]),
+        Action("run_tests",    ["?bridge"],          [("bridge_built", "?bridge")], [("tests_passed", "?bridge")]),
+    ]
+
+    state4 = {("system_ready",), ("rust_toolchain",)}
+
+    _counter = 0
+    result4 = backward_chain([("tests_passed", "?out")], actions_build, state4)
+
+    if result4:
+        plan4, subst4 = result4
+        print(f"Plan found (output: {walk('?out', subst4)}):")
+        format_plan(plan4, subst4)
+    else:
+        print("No plan found")
+
+    print("\n=== Example 5: A* cost-optimal planning ===")
+
+    actions_cost = [
+        Action("fast_compile", ["?src", "?bin"], [("source_ready", "?src")], [("executable", "?bin")], cost=1),
+        Action("opt_compile",  ["?src", "?bin"], [("source_ready", "?src"), ("opt_flags_set",)], [("executable", "?bin"), ("optimized", "?bin")], cost=5),
+        Action("quick_test",   ["?bin"], [("executable", "?bin")], [("tested", "?bin")], cost=1),
+        Action("full_test",    ["?bin"], [("executable", "?bin"), ("test_env_ready",)], [("tested", "?bin"), ("coverage_done",)], cost=10),
+    ]
+
+    state5 = {("source_ready", "main.rs")}
+
+    _counter = 0
+    result5_dfs = backward_chain([("tested", "?out")], actions_cost, state5)
+    if result5_dfs:
+        p, s = result5_dfs
+        print("DFS plan (first found):")
+        format_plan(p, s)
+
+    _counter = 0
+    result5_astar = backward_chain_astar([("tested", "?out")], actions_cost, state5)
+    if result5_astar:
+        p, s, cost = result5_astar
+        print(f"A* plan (optimal, total cost = {cost}):")
+        format_plan(p, s)
+
+    state5b = {("source_ready", "main.rs"), ("opt_flags_set",), ("test_env_ready",)}
+
+    _counter = 0
+    result5b = backward_chain_astar(
+        [("tested", "?out"), ("optimized", "?out"), ("coverage_done",)],
+        actions_cost,
+        state5b,
+    )
+    if result5b:
+        p, s, cost = result5b
+        print(f"\nA* plan for full pipeline (total cost = {cost}):")
+        format_plan(p, s)
