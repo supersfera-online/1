@@ -1,0 +1,416 @@
+import heapq
+
+class InformationRemnant:
+    """
+    Материя как информационный остаток (+2).
+    Действие не просто меняет состояние, оно несет 'информационную массу'.
+    """
+    def __init__(self, name, preconditions, effects, complexity=1):
+        self.name = name
+        self.pre = set(preconditions)
+        self.eff = set(effects)
+        # Информационная плотность остатка (complexity)
+        self.mass = complexity
+
+class SupersphereEngine:
+    """
+    Двигатель Хаоса для поиска стабильных структур в океане возможностей.
+    Применяет теорию Славы для оптимизации логического вывода.
+    """
+    def __init__(self, remnants):
+        self.remnants = remnants
+        # Константа движения c (затраты на один квант времени)
+        self.c = 1 
+
+    def get_entropic_pressure(self, goals, initial_state):
+        """
+        Эвристика: измеряет градиент энтропии. 
+        Чем меньше условий осталось выполнить, тем ниже давление (цель ближе).
+        """
+        return len(goals - initial_state)
+
+    def evolve(self, target_information, vacuum_state):
+        """
+        Процесс развертывания Вселенной от цели назад (антиматерия) 
+        к источнику (Суперсфера).
+        """
+        target_info = set(target_information)
+        initial_symmetry = set(vacuum_state)
+
+        # Очередь приоритетов: (Энтропийное давление, затраченное время, план, текущие цели)
+        # Гравитация информации тянет нас к наиболее вероятному пути
+        chaos_frontier = []
+        initial_pressure = self.get_entropic_pressure(target_info, initial_symmetry)
+        
+        # (Приоритет, Стоимость времени, Список действий, Текущий набор целей)
+        heapq.heappush(chaos_frontier, (initial_pressure, 0, [], target_info))
+
+        # Мемоизация для аннигиляции повторяющихся конфигураций хаоса
+        seen_symmetries = set()
+
+        while chaos_frontier:
+            pressure, time_elapsed, current_structure, current_goals = heapq.heappop(chaos_frontier)
+
+            # Если цели достигнуты (структура стабильна в вакууме)
+            if not current_goals or current_goals.issubset(initial_symmetry):
+                return current_structure[::-1] # Разворачиваем временной вектор для материи
+
+            # Аннигиляция циклов: если мы уже видели эту сложность, не тратим c
+            state_signature = tuple(sorted(list(current_goals)))
+            if state_signature in seen_symmetries:
+                continue
+            seen_symmetries.add(state_signature)
+
+            for action in self.remnants:
+                # Если флуктуация Хаоса (действие) дает нужный информационный эффект
+                if action.eff & current_goals:
+                    # Движение по вектору времени назад: убираем эффект, добавляем причины
+                    next_goals = (current_goals - action.eff) | action.pre
+                    # Убираем то, что уже есть в начальной Суперсфере
+                    next_goals = next_goals - initial_symmetry
+
+                    # Расчет новой энтропийной плотности
+                    # Мы учитываем стоимость движения (c) и информационную массу (mass)
+                    new_time = time_elapsed + self.c
+                    new_pressure = self.get_entropic_pressure(next_goals, initial_symmetry) + new_time / action.mass
+                    
+                    new_structure = current_structure + [action.name]
+                    
+                    heapq.heappush(chaos_frontier, (new_pressure, new_time, new_structure, next_goals))
+
+        return None
+
+# --- ПРАКТИЧЕСКАЯ РЕАЛИЗАЦИЯ (BUILD SYSTEM) ---
+
+# Описываем флуктуации (действия) с учетом их информационной массы
+fluctuations = [
+    InformationRemnant("Compile Tensor", ["have_source"], ["have_executable"], complexity=2),
+    InformationRemnant("Link PJRT", ["have_executable", "have_lib"], ["have_binary"], complexity=3),
+    InformationRemnant("Run Test", ["have_binary"], ["test_passed"], complexity=1),
+    # Тупиковая флуктуация (шум Хаоса)
+    InformationRemnant("Clean Build", [], ["disk_space_freed"], complexity=0.5)
+]
+
+# Инициализация Двигателя
+engine = SupersphereEngine(fluctuations)
+
+# Начальное состояние (Суперсфера / Вакуум)
+initial_symmetry = ["have_source", "have_lib"]
+# Целевая структура (Максимальная информация)
+target_remnant = ["test_passed"]
+
+stable_plan = engine.evolve(target_remnant, initial_symmetry)
+
+if stable_plan:
+    print("--- SUCCESS: Stable Information Remnant Established ---")
+    for i, step in enumerate(stable_plan, 1):
+        print(f"Era {i}: {step}")
+else:
+    print("--- FAILURE: Information vanished into the Supersphere ---")
+
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    # Новые условия хаоса
+fluctuations_v2 = [
+    # Теперь для компиляции НУЖНО свободное место
+    InformationRemnant("Compile Tensor", ["have_source", "disk_is_free"], ["have_executable"], complexity=2),
+    
+    InformationRemnant("Link PJRT", ["have_executable", "have_lib"], ["have_binary"], complexity=3),
+    InformationRemnant("Run Test", ["have_binary"], ["test_passed"], complexity=1),
+    
+    # Это действие ДАЕТ свободное место, но ничего не требует на входе
+    InformationRemnant("Clean Build", [], ["disk_is_free"], complexity=0.5)
+]
+
+# Инициализируем движок с новыми правилами
+engine_v2 = SupersphereEngine(fluctuations_v2)
+
+# В начальной симметрии (состоянии мира) НЕТ свободного места
+initial_symmetry_v2 = ["have_source", "have_lib"]
+target_remnant_v2 = ["test_passed"]
+
+# Запуск эволюции
+stable_plan_v2 = engine_v2.evolve(target_remnant_v2, initial_symmetry_v2)
+
+if stable_plan_v2:
+    print("--- СИСТЕМА АДАПТИРОВАЛАСЬ: План найден ---")
+    for i, step in enumerate(stable_plan_v2, 1):
+        print(f"Era {i}: {step}")
+else:
+    print("--- КОЛЛАПС: Ресурс не найден в Суперсфере ---")
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+"""
+Backward Chaining Planner with Unification (Prolog/PDDL style)
+
+Supports:
+- Variable unification (?x, ?y, etc.)
+- Partial effect matching (action needs at least one relevant effect)
+- Substitution propagation through the plan
+- Cumulative state tracking (effects of planned actions enrich the state)
+- A* search mode with action costs and heuristic guidance
+"""
+
+import heapq
+from typing import Optional
+
+
+# --- Unification ---
+
+def is_var(term) -> bool:
+    return isinstance(term, str) and term.startswith("?")
+
+
+def walk(term, subst: dict):
+    """Resolve a term through substitution chain to its final value."""
+    seen = set()
+    while is_var(term) and term in subst and term not in seen:
+        seen.add(term)
+        term = subst[term]
+    if isinstance(term, tuple):
+        return tuple(walk(t, subst) for t in term)
+    if isinstance(term, list):
+        return [walk(t, subst) for t in term]
+    return term
+
+
+def unify(t1, t2, subst: dict) -> Optional[dict]:
+    """Unify two terms under existing substitutions. Returns new subst or None."""
+    t1 = walk(t1, subst)
+    t2 = walk(t2, subst)
+
+    if t1 == t2:
+        return subst
+    if is_var(t1):
+        return {**subst, t1: t2}
+    if is_var(t2):
+        return {**subst, t2: t1}
+    if isinstance(t1, (tuple, list)) and isinstance(t2, (tuple, list)):
+        if len(t1) != len(t2):
+            return None
+        for a, b in zip(t1, t2):
+            subst = unify(a, b, subst)
+            if subst is None:
+                return None
+        return subst
+    return None
+
+
+def apply_subst(predicates: list, subst: dict) -> list:
+    return [walk(p, subst) for p in predicates]
+
+
+# --- Planner ---
+
+class Action:
+    def __init__(self, name: str, params: list, preconditions: list, effects: list, cost: float = 1.0):
+        self.name = name
+        self.params = params
+        self.pre = preconditions
+        self.eff = effects
+        self.cost = cost
+
+    def fresh(self, counter: int) -> "Action":
+        """Create a fresh copy with renamed variables to avoid capture."""
+        rename = {p: f"{p}_{counter}" for p in self.params}
+        a = Action(
+            self.name,
+            [rename[p] for p in self.params],
+            apply_subst(self.pre, rename),
+            apply_subst(self.eff, rename),
+            self.cost,
+        )
+        return a
+
+
+_counter = 0
+
+
+def _next_id():
+    global _counter
+    _counter += 1
+    return _counter
+
+
+def _matches_any(goal, state, subst):
+    """Try to unify goal with any fact in state. Returns updated subst or None."""
+    for fact in state:
+        result = unify(goal, fact, subst)
+        if result is not None:
+            return result
+    return None
+
+
+def backward_chain(
+    goals: list,
+    actions: list[Action],
+    state: set,
+    depth: int = 20,
+    subst: dict | None = None,
+) -> Optional[tuple[list[tuple[str, dict]], dict]]:
+    """
+    Backward chaining with unification and cumulative state.
+
+    Returns (plan, final_substitution) or None.
+    """
+    if subst is None:
+        subst = {}
+
+    # Partition goals into satisfied and unsatisfied
+    current_subst = subst
+    unsatisfied = []
+    for g in goals:
+        resolved = walk(g, current_subst)
+        result = _matches_any(resolved, state, current_subst)
+        if result is not None:
+            current_subst = result
+        else:
+            unsatisfied.append(g)
+
+    if not unsatisfied:
+        return ([], current_subst)
+
+    if depth == 0:
+        return None
+
+    # Pick first unsatisfied goal
+    target = walk(unsatisfied[0], current_subst)
+
+    for action in actions:
+        fresh_action = action.fresh(_next_id())
+
+        for eff in fresh_action.eff:
+            new_subst = unify(eff, target, current_subst.copy())
+            if new_subst is None:
+                continue
+
+            # Add preconditions as new subgoals + remaining unsatisfied goals
+            new_pre = apply_subst(fresh_action.pre, new_subst)
+            remaining = apply_subst(unsatisfied[1:], new_subst)
+            new_goals = new_pre + remaining
+
+            # After this action executes, its effects become part of the state
+            new_effects = set(apply_subst(fresh_action.eff, new_subst))
+            expanded_state = state | new_effects
+
+            result = backward_chain(new_goals, actions, expanded_state, depth - 1, new_subst)
+            if result is not None:
+                sub_plan, final_subst = result
+                resolved_params = apply_subst(fresh_action.params, final_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                return (sub_plan + [step], final_subst)
+
+    return None
+
+
+def backward_chain_astar(
+    goals: list,
+    actions: list[Action],
+    state: set,
+) -> Optional[tuple[list[tuple[str, dict]], dict, float]]:
+    """
+    A* backward chaining with unification and action costs.
+
+    Finds the lowest-cost plan. Returns (plan, final_subst, total_cost) or None.
+    Heuristic: number of unsatisfied goals (admissible for unit-cost actions).
+    """
+    counter = 0
+
+    def make_node(goals, subst, expanded_state, plan, g_cost):
+        nonlocal counter
+        counter += 1
+        h = 0
+        for g in goals:
+            resolved = walk(g, subst)
+            if _matches_any(resolved, expanded_state, subst) is None:
+                h += 1
+        return (g_cost + h, counter, goals, subst, expanded_state, plan, g_cost)
+
+    start = make_node(goals, {}, state, [], 0.0)
+    frontier = [start]
+    visited = set()
+
+    while frontier:
+        f, _, cur_goals, cur_subst, cur_state, cur_plan, g = heapq.heappop(frontier)
+
+        remaining_subst = cur_subst
+        unsatisfied = []
+        for goal in cur_goals:
+            resolved = walk(goal, remaining_subst)
+            result = _matches_any(resolved, cur_state, remaining_subst)
+            if result is not None:
+                remaining_subst = result
+            else:
+                unsatisfied.append(goal)
+
+        if not unsatisfied:
+            return (cur_plan, remaining_subst, g)
+
+        sig_goals = tuple(sorted(str(walk(u, remaining_subst)) for u in unsatisfied))
+        if sig_goals in visited:
+            continue
+        visited.add(sig_goals)
+
+        target = walk(unsatisfied[0], remaining_subst)
+
+        for action in actions:
+            fresh_action = action.fresh(_next_id())
+
+            for eff in fresh_action.eff:
+                new_subst = unify(eff, target, remaining_subst.copy())
+                if new_subst is None:
+                    continue
+
+                new_pre = apply_subst(fresh_action.pre, new_subst)
+                remaining = apply_subst(unsatisfied[1:], new_subst)
+                new_goals = new_pre + remaining
+
+                new_effects = set(apply_subst(fresh_action.eff, new_subst))
+                expanded_state = cur_state | new_effects
+
+                resolved_params = apply_subst(fresh_action.params, new_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                new_plan = cur_plan + [step]
+                new_g = g + action.cost
+
+                node = make_node(new_goals, new_subst, expanded_state, new_plan, new_g)
+                heapq.heappush(frontier, node)
+
+    return None
+
+
+def format_plan(plan: list[tuple[str, dict]], subst: dict | None = None) -> None:
+    for i, (name, bindings) in enumerate(plan, 1):
+        if subst:
+            bindings = {k: walk(v, subst) for k, v in bindings.items()}
+      
+  bound = {k: v for k, v in bindings.items() if not is_var(v)}
+        if bound:
+            args = ", ".join(f"{k}={v}" for k, v in bound.items())
+            print(f"  {i}. {name}({args})")
+        else:
+            print(f"  {i}. {name}()")
+
+    
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    fluctuations_v3 = [
+    InformationRemnant("Install ROCm", ["have_sudo", "os_supported"], ["rocm_installed"], complexity=5),
+    InformationRemnant("Install Python", ["have_sudo"], ["python_ready"], complexity=1),
+    InformationRemnant("Clone JAX", ["python_ready", "have_internet"], ["jax_source"], complexity=2),
+    InformationRemnant("Build JAX", ["jax_source", "rocm_installed", "disk_is_free"], ["jax_built"], complexity=8),
+    InformationRemnant("Install JAX", ["jax_built", "python_ready"], ["jax_installed"], complexity=2),
+    InformationRemnant("Clone XLA", ["have_internet"], ["xla_source"], complexity=2),
+    InformationRemnant("Build XLA", ["xla_source", "rocm_installed", "disk_is_free"], ["xla_built"], complexity=10),
+    InformationRemnant("Link XLA", ["xla_built", "jax_built"], ["jax_xla_linked"], complexity=3),
+    InformationRemnant("Run Benchmark", ["jax_xla_linked", "jax_installed"], ["benchmark_passed"], complexity=1),
+    InformationRemnant("Clean Build", [], ["disk_is_free"], complexity=0.5),
+    InformationRemnant("Enable Internet", [], ["have_internet"], complexity=0.1),
+    InformationRemnant("Get Sudo", [], ["have_sudo"], complexity=0.1),
+    InformationRemnant("Check OS", ["have_sudo"], ["os_supported"], complexity=1),
+]
+
+initial = []
+target = ["benchmark_passed"]
+
+
