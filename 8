@@ -1,0 +1,29 @@
+$$\text{Goal} \xrightarrow{\text{regress}} \text{Preconditions} \xrightarrow{\text{regress}} \dots \xrightarrow{} \text{Initial}$$
+$$\text{next\_goals} = (\text{goals} \setminus \text{eff}) \cup \text{pre}$$
+$$\theta = \text{mgu}(t_1, t_2) \quad : \quad t_1\theta = t_2\theta$$
+$$f(n) = g(n) + h(n)$$
+$$\forall x \in S: x = 0$$
+$$\chi = \text{const}$$
+$$P(\pm 1 \mid \chi) = 1$$
+$$+1 + (-1) = 0$$
+$$+1 + (+1) = +2$$
+$$-1 + (-1) = -2$$
+$$N_{\pm 2}(t) = \#\{\text{пары}(\pm 1, \pm 1) \text{ до } t\}$$
+$$\frac{dN_{\pm 2}}{dt}$$
+$$G \propto \nabla n_2$$
+$$\frac{dN_{+2}}{dt} > 0$$
+$$a_2 \propto \frac{dN_{+2}}{dt}$$
+$$E_{\pm}(t) = \frac{1}{w} \sum_{\tau = t-w}^{t} \mathbb{1}[\pm 1 \pm 1 \text{ at } \tau]$$
+$$B(t) = k(t) \cdot E(t)$$
+$$B(t) = k(t) \cdot n_2(t)$$
+$$k(t) = k_0 + \mu n_2(t)$$
+$$\text{pctile}[E_+(t)] \to 0 \quad \land \quad \text{pctile}[E_-(t)] \to 1 \quad \Rightarrow \quad \text{направление} = -\text{sign}(E_+ - E_-)$$
+$$E_+(t) \approx E_-(t) \approx 0 \quad \land \quad k(t) \to \min \quad \Rightarrow \quad |\Delta P| \uparrow, \quad \text{sign}(\Delta P) = ?$$
+$$\Lambda(t) = \bigwedge_{m \in M} \Bigl[ \text{pctile}_m \bigl[ E_-(t) \cdot k_m(t) \bigr] > \theta \Bigr]$$
+$$\begin{cases}
+B(t) = (k_0 + \mu n_2(t)) \, n_2(t) \\
+\dfrac{dn_2}{dt} = \alpha B(t) \, n_+^2(t) - \gamma n_2(t) \\
+a_2(t) = \beta \dfrac{dn_2}{dt}
+\end{cases}$$
+$$\frac{\partial n_2}{\partial t} = D \nabla^2 n_2 + \alpha B(t) n_+^2 - \gamma n_2 + \nabla \cdot \bigl( \mathbf{v}(G) n_2 \bigr)$$
+$$dn_2 = \bigl[ \alpha B(t) n_+^2(t) - \gamma n_2 \bigr] dt + \sigma(\chi) \, dW(t)$$
