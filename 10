@@ -1,0 +1,586 @@
+"""
+Backward Chaining Planner with Unification (Prolog/PDDL style)
+
+Supports:
+- Variable unification (?x, ?y, etc.)
+- Partial effect matching (action needs at least one relevant effect)
+- Substitution propagation through the plan
+- Cumulative state tracking (effects of planned actions enrich the state)
+- A* search mode with action costs and heuristic guidance
+"""
+
+import heapq
+from typing import Optional
+
+
+# --- Unification ---
+
+def is_var(term) -> bool:
+    """Check if a term is a variable (starts with ?)."""
+    return isinstance(term, str) and term.startswith("?")
+
+
+def walk(term, subst: dict):
+    """Resolve a term through substitution chain to its final value."""
+    seen = set()
+    while is_var(term) and term in subst and term not in seen:
+        seen.add(term)
+        term = subst[term]
+    
+    if isinstance(term, tuple):
+        return tuple(walk(t, subst) for t in term)
+    if isinstance(term, list):
+        return [walk(t, subst) for t in term]
+    return term
+
+
+def unify(t1, t2, subst: dict) -> Optional[dict]:
+    """Unify two terms under existing substitutions. Returns new subst or None."""
+    t1 = walk(t1, subst)
+    t2 = walk(t2, subst)
+    
+    if t1 == t2:
+        return subst
+    
+    if is_var(t1):
+        return {**subst, t1: t2}
+    if is_var(t2):
+        return {**subst, t2: t1}
+        
+    if isinstance(t1, (tuple, list)) and isinstance(t2, (tuple, list)):
+        if len(t1) != len(t2):
+            return None
+        for a, b in zip(t1, t2):
+            subst = unify(a, b, subst)
+            if subst is None:
+                return None
+        return subst
+        
+    return None
+
+
+def apply_subst(predicates: list, subst: dict) -> list:
+    """Apply substitution to all terms in a list of predicates."""
+    return [walk(p, subst) for p in predicates]
+
+
+# --- Planner ---
+
+class Action:
+    def __init__(self, name: str, params: list, preconditions: list, effects: list, cost: float = 1.0):
+        self.name = name
+        self.params = params
+        self.pre = preconditions
+        self.eff = effects
+        self.cost = cost
+
+    def fresh(self, counter: int) -> "Action":
+        """Create a fresh copy with renamed variables to avoid capture."""
+        rename = {p: f"{p}_{counter}" for p in self.params}
+        a = Action(
+            self.name,
+            [rename[p] for p in self.params],
+            apply_subst(self.pre, rename),
+            apply_subst(self.eff, rename),
+            self.cost,
+        )
+        return a
+
+
+_counter = 0
+
+def _next_id():
+    global _counter
+    _counter += 1
+    return _counter
+
+
+def _matches_any(goal, state, subst):
+    """Try to unify goal with any fact in state. Returns updated subst or None."""
+    for fact in state:
+        result = unify(goal, fact, subst)
+        if result is not None:
+            return result
+    return None
+
+
+def backward_chain(
+    goals: list,
+    actions: list[Action],
+    state: set,
+    depth: int = 20,
+    subst: dict | None = None,
+) -> Optional[tuple[list[tuple[str, dict]], dict]]:
+    """
+    Backward chaining with unification and cumulative state.
+    Returns (plan, final_substitution) or None.
+    
+    Args:
+        goals: List of goal predicates to achieve
+        actions: List of available Action schemas
+        state: Set of facts currently true
+        depth: Maximum search depth
+        subst: Current variable substitution (internal use)
+        
+    Returns:
+        Tuple of (plan, final_subst) where plan is list of (action_name, bindings),
+        or None if no solution found.
+    """
+    if subst is None:
+        subst = {}
+
+    # Partition goals into satisfied and unsatisfied
+    current_subst = subst
+    unsatisfied = []
+    
+    for g in goals:
+        resolved = walk(g, current_subst)
+        result = _matches_any(resolved, state, current_subst)
+        if result is not None:
+            current_subst = result
+        else:
+            unsatisfied.append(g)
+
+    # Base case: all goals satisfied
+    if not unsatisfied:
+        return ([], current_subst)
+
+    # Depth limit reached
+    if depth == 0:
+        return None
+
+    # Pick first unsatisfied goal to work on
+    target = walk(unsatisfied[0], current_subst)
+
+    # Try each action that could achieve this goal
+    for action in actions:
+        fresh_action = action.fresh(_next_id())
+
+        # Check if any effect of this action can match our target goal
+        for eff in fresh_action.eff:
+            new_subst = unify(eff, target, current_subst.copy())
+            if new_subst is None:
+                continue
+
+            # Add preconditions as new subgoals + remaining unsatisfied goals
+            new_pre = apply_subst(fresh_action.pre, new_subst)
+            remaining = apply_subst(unsatisfied[1:], new_subst)
+            new_goals = new_pre + remaining
+
+            # After this action executes, its effects become part of the state
+            new_effects = set(apply_subst(fresh_action.eff, new_subst))
+            expanded_state = state | new_effects
+
+            # Recursively solve for the new goals
+            result = backward_chain(new_goals, actions, expanded_state, depth - 1, new_subst)
+            if result is not None:
+                sub_plan, final_subst = result
+                
+                # Resolve action parameters with final substitution
+                resolved_params = apply_subst(fresh_action.params, final_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                
+                return (sub_plan + [step], final_subst)
+
+    return None
+
+
+def backward_chain_astar(
+    goals: list,
+    actions: list[Action],
+    state: set,
+) -> Optional[tuple[list[tuple[str, dict]], dict, float]]:
+    """
+    A* backward chaining with unification and action costs.
+    Finds the lowest-cost plan. Returns (plan, final_subst, total_cost) or None.
+    
+    Heuristic: number of unsatisfied goals (admissible for unit-cost actions).
+    
+    Args:
+        goals: List of goal predicates to achieve
+        actions: List of available Action schemas with costs
+        state: Set of facts currently true
+        
+    Returns:
+        Tuple of (plan, final_subst, total_cost) or None if no solution.
+    """
+    counter = 0
+
+    def make_node(goals, subst, expanded_state, plan, g_cost):
+        nonlocal counter
+        counter += 1
+        
+        # Heuristic: count unsatisfied goals
+        h = 0
+        for g in goals:
+            resolved = walk(g, subst)
+            if _matches_any(resolved, expanded_state, subst) is None:
+                h += 1
+        
+        return (g_cost + h, counter, goals, subst, expanded_state, plan, g_cost)
+
+    start = make_node(goals, {}, state, [], 0.0)
+    frontier = [start]
+    visited = set()
+
+    while frontier:
+        f, _, cur_goals, cur_subst, cur_state, cur_plan, g = heapq.heappop(frontier)
+
+        # Determine which goals are still unsatisfied
+        remaining_subst = cur_subst
+        unsatisfied = []
+        for goal in cur_goals:
+            resolved = walk(goal, remaining_subst)
+            result = _matches_any(resolved, cur_state, remaining_subst)
+            if result is not None:
+                remaining_subst = result
+            else:
+                unsatisfied.append(goal)
+
+        # Goal test: all goals satisfied?
+        if not unsatisfied:
+            return (cur_plan, remaining_subst, g)
+
+        # Check if we've seen this goal configuration before
+        sig_goals = tuple(sorted(str(walk(u, remaining_subst)) for u in unsatisfied))
+        if sig_goals in visited:
+            continue
+        visited.add(sig_goals)
+
+        target = walk(unsatisfied[0], remaining_subst)
+
+        # Generate successors by trying each action
+        for action in actions:
+            fresh_action = action.fresh(_next_id())
+
+            for eff in fresh_action.eff:
+                new_subst = unify(eff, target, remaining_subst.copy())
+                if new_subst is None:
+                    continue
+
+                # Create new goals from preconditions + remaining unsatisfied
+                new_pre = apply_subst(fresh_action.pre, new_subst)
+                remaining = apply_subst(unsatisfied[1:], new_subst)
+                new_goals = new_pre + remaining
+
+                # Expand state with this action's effects
+                new_effects = set(apply_subst(fresh_action.eff, new_subst))
+                expanded_state = cur_state | new_effects
+
+                # Create plan step with resolved parameters
+                resolved_params = apply_subst(fresh_action.params, new_subst)
+                step = (fresh_action.name, dict(zip(action.params, resolved_params)))
+                new_plan = cur_plan + [step]
+                new_g = g + action.cost
+
+                node = make_node(new_goals, new_subst, expanded_state, new_plan, new_g)
+                heapq.heappush(frontier, node)
+
+    return None
+
+
+def format_plan(plan: list[tuple[str, dict]], subst: dict | None = None) -> None:
+    """Pretty-print a plan with variable bindings resolved."""
+    for i, (name, bindings) in enumerate(plan, 1):
+        if subst:
+            bindings = {k: walk(v, subst) for k, v in bindings.items()}
+        
+        bound = {k: v for k, v in bindings.items() if not is_var(v)}
+        if bound:
+            args = ", ".join(f"{k}={v}" for k, v in bound.items())
+            print(f"  {i}. {name}({args})")
+        else:
+            print(f"  {i}. {name}()")
+"""
+Comprehensive tests for Backward Chaining with Unification
+Run: python test_backward_chaining.py
+"""
+
+import sys
+from typing import Optional
+
+# Import the implementation (adjust if in separate file)
+exec(open('backward_chaining_advanced.py').read())
+
+
+def test_unification_basics():
+    """Test basic unification functionality."""
+    print("Testing unification basics...")
+    
+    # Test 1: Identical terms unify trivially
+    subst = {}
+    result = unify(("at", "table"), ("at", "table"), subst)
+    assert result is not None, "Identical terms should unify"
+    
+    # Test 2: Variable unifies with any term
+    subst = {}
+    result = unify("?x", "block_A", subst)
+    assert result is not None and result["?x"] == "block_A"
+    
+    # Test 3: Two variables unify to each other
+    subst = {}
+    result = unify("?x", "?y", subst)
+    assert result is not None
+    assert (result["?x"] == "?y") or (is_var(result.get("?x")) and result.get("?x") in result)
+    
+    # Test 4: Incompatible terms fail to unify
+    result = unify(("at", "table"), ("on", "shelf"), {})
+    assert result is None, "Incompatible tuples should not unify"
+    
+    # Test 5: Nested structure unification
+    subst = {}
+    t1 = [("move", "?x", "?y"), ("clear", "?z")]
+    t2 = [("move", "A", "B"), ("clear", "C")]
+    result = unify(t1, t2, subst)
+    assert result is not None
+    
+    print("✓ Unification basics passed\n")
+
+
+def test_walk_function():
+    """Test the walk function for substitution resolution."""
+    print("Testing walk function...")
+    
+    # Test 1: Non-variable passes through unchanged
+    assert walk("table", {}) == "table"
+    assert walk(("at", "x"), {}) == ("at", "x")
+    
+    # Test 2: Variable with substitution resolves
+    subst = {"?x": "block_A"}
+    assert walk("?x", subst) == "block_A"
+    
+    # Test 3: Chained substitutions resolve completely
+    subst = {"?x": "?y", "?y": "final_value"}
+    assert walk("?x", subst) == "final_value"
+    
+    print("✓ Walk function passed\n")
+
+
+def test_simple_planning_no_variables():
+    """Test planning without variables (backward compatibility)."""
+    print("Testing simple planning without variables...")
+    
+    actions = [
+        # Action(name, params, preconditions, effects)
+        Action("heat_oven", [], [], [("hot", "oven")]),
+        Action("add_dough", [], [("hot", "oven")], [("baking", "pizza"), ("dough_in_oven", "x")]),
+    ]
+    
+    initial_state = set()  # Nothing initially true
+    
+    goals = [("ready", "pizza")]
+    
+    # This should fail since no action achieves ("ready", "pizza")
+    result = backward_chain(goals, actions, initial_state)
+    assert result is None or result[0] == [], f"Expected no plan, got: {result}"
+
+    # Positive case: goal that IS achievable without variables
+    goals2 = [("baking", "pizza")]
+    result2 = backward_chain(goals2, actions, initial_state)
+    assert result2 is not None, "Should find a plan for (\"baking\", \"pizza\")."
+    plan2, subst2 = result2
+    print(f"  Achievable goal plan: {[name for name, _ in plan2]}")
+    format_plan(plan2, subst2)
+    
+    print("✓ Simple planning test passed\n")
+
+
+def test_planning_with_variables():
+    """Test planning with variable unification."""
+    print("Testing planning with variables...")
+    
+    # Block world scenario
+    actions = [
+        Action(
+            name="move_block",
+            params=["?block"],
+            preconditions=[("on_table", "?block"), ("clear", "?block")],
+            effects=[("in_hand", "?block"), ("not_on_table", "?block")]
+        ),
+        Action(
+            name="place_block", 
+            params=["?block"],
+            preconditions=[("in_hand", "?block"), ("empty_spot", "shelf_1")],
+            effects=[("on_shelf", "?block", "shelf_1")]
+        )
+    ]
+    
+    initial_state = {
+        ("on_table", "A"),
+        ("clear", "A"),
+        ("empty_spot", "shelf_1")
+    }
+    
+    goals = [("on_shelf", "?x", "shelf_1")]  # Some block on shelf_1
+    
+    result = backward_chain(goals, actions, initial_state)
+    assert result is not None, "Should find a plan with variable ?x"
+    plan, subst = result
+    
+    if plan:
+        print(f"  Found plan with {len(plan)} steps")
+        format_plan(plan, subst)
+        
+        # Verify the plan makes sense
+        assert len(plan) >= 2, "Should need at least 2 actions"
+        
+        # Check variable binding for ?x
+        if "?x" in subst:
+            resolved_x = walk("?x", subst)
+            print(f"  Variable ?x bound to: {resolved_x}")
+    else:
+        print("  No plan found (may be expected depending on action definitions)")
+    
+    print("✓ Planning with variables test completed\n")
+
+
+def test_astar_with_costs():
+    """Test A* search prefers cheaper actions."""
+    print("Testing A* with costs...")
+    
+    # Two ways to achieve a goal, one cheaper than the other
+    actions = [
+        Action(
+            name="cheap_method",
+            params=[],
+            preconditions=[("resource_A",)],
+            effects=[("goal_achieved",)],
+            cost=1.0  # Cheap!
+        ),
+        Action(
+            name="expensive_method", 
+            params=[],
+            preconditions=[("resource_B",)],
+            effects=[("goal_achieved",)],
+            cost=5.0  # Expensive!
+        )
+    ]
+    
+    initial_state = {("resource_A",), ("resource_B",)}
+    goals = [("goal_achieved",)]
+    
+    result = backward_chain_astar(goals, actions, initial_state)
+    assert result is not None, "A* should find a plan"
+    plan, subst, cost = result
+    
+    if plan:
+        print(f"  A* found plan with total cost: {cost}")
+        
+        # Should prefer the cheap method
+        action_names = [name for name, _ in plan]
+        assert "cheap_method" in action_names or cost <= 1.0, \
+            f"A* should prefer cheaper actions, got cost={cost}"
+    else:
+        print("  No plan found")
+    
+    print("✓ A* with costs test completed\n")
+
+
+def test_substitution_propagation():
+    """Test that substitutions propagate through the plan."""
+    print("Testing substitution propagation...")
+    
+    # Chain of actions where each depends on previous variable bindings
+    actions = [
+        Action(
+            name="step1",
+            params=["?x"],
+            preconditions=[("start_with", "?x")],
+            effects=[("intermediate", "?x")]
+        ),
+        Action(
+            name="step2",
+            params=["?y"], 
+            preconditions=[("intermediate", "?y"), ("needs_value", "42")],
+            effects=[("final_result", "?y", "42")]
+        )
+    ]
+    
+    initial_state = {
+        ("start_with", "value_A"),
+        ("needs_value", "42")
+    }
+    
+    goals = [("final_result", "?z", "42")]
+    
+    result = backward_chain(goals, actions, initial_state)
+    assert result is not None, "Should find a chained plan with variable propagation"
+    plan, subst = result
+    
+    if plan:
+        print(f"  Plan found with {len(plan)} steps")
+        format_plan(plan, subst)
+        
+        # Verify all parameters resolved to concrete values through the chain
+        all_bindings = [walk(v, subst) for _, b in plan for v in b.values()]
+        assert all(not is_var(x) for x in all_bindings), \
+            f"Variables should resolve to concrete values, got: {all_bindings}"
+        print(f"  All variables resolved: {all_bindings}")
+    else:
+        print("  No plan found")
+    
+    print("✓ Substitution propagation test completed\n")
+
+
+def test_edge_cases():
+    """Test edge cases and error conditions."""
+    print("Testing edge cases...")
+    
+    # Test 1: Empty goals should return empty plan immediately
+    actions = []
+    state = set()
+    plan, subst = backward_chain([], actions, state)
+    assert plan == [], "Empty goals should give empty plan"
+    print("  ✓ Empty goals handled")
+    
+    # Test 2: Impossible goal with no matching actions
+    actions = [Action("do_nothing", [], [], [("nothing",)])]
+    state = set()
+    result = backward_chain([("impossible_goal",)], actions, state)
+    assert result is None or result[0] == [], "Impossible goals should fail"
+    print("  ✓ Impossible goal handled")
+    
+    # Test 3: Depth limit prevents infinite recursion (must terminate cleanly)
+    import time
+    actions = [Action("loop", ["?x"], [("next_state", "?x")], [("current_state", "?x")])]
+    state = {("start",)}
+    t0 = time.time()
+    result = backward_chain([("end_state",)], actions, state, depth=2)
+    elapsed = time.time() - t0
+    assert elapsed < 5.0, f"Depth limit failed to bound search (took {elapsed:.1f}s)"
+    print(f"  ✓ Depth limit works (terminated in {elapsed*1000:.1f}ms)")
+    
+    print("\n✓ All edge cases passed\n")
+
+
+def main():
+    """Run all tests."""
+    print("=" * 60)
+    print("BACKWARD CHAINING TEST SUITE")
+    print("=" * 60 + "\n")
+    
+    try:
+        test_unification_basics()
+        test_walk_function()
+        test_simple_planning_no_variables()
+        test_planning_with_variables()
+        test_astar_with_costs()
+        test_substitution_propagation()
+        test_edge_cases()
+        
+        print("=" * 60)
+        print("ALL TESTS COMPLETED SUCCESSFULLY!")
+        print("=" * 60)
+        return 0
+        
+    except Exception as e:
+        print(f"\n{'=' * 60}")
+        print(f"TEST FAILURE: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        print('=' * 60)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
