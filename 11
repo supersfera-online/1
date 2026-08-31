@@ -1,0 +1,161 @@
+Advanced analysis of exponential calculations, hardware errors, and chaos theory
+1.1 How silicon calculates the constant $e$ and continuous functions
+The fundamental mathematical constant $e \approx 2.71828...$ describes natural continuous processes: diffusion, electromagnetic wave attenuation, exponential growth, and probability distributions. However, a digital processor (GPU/CPU) is discrete:
+
+Hardware conversion to a power of two:Direct analytical calculation of $e^x$ at the transistor level is not implemented due to its high complexity. Instead, in the GPU microcode, the operation is reduced to a basic binary exponential: $$e^x = 2^{x \cdot \log_2 e}$$ where the constant $\log_2 e \approx 1.442695...$ is hardcoded into the Special Function Unit (SFU) hardware register.
+Polynomial approximations:The calculation of logarithms and exponentials within SFU is performed using truncated Taylor series, Chebyshev polynomials, or fixed-precision Padé approximations.
+Replacing physical formulas with heuristics:In graphics problems, the attenuation of light with distance is calculated not through differential equations with $e^{-\alpha x}$, but through quadratic interpolations $\frac{1}{a + bx + cx^2}$ or sampling from pre-baked Look-Up Tables (LUTs).
+
+
+1.2. The problem of accuracy in neural networks: the conflict between hardware and algorithms
+In 3D graphics, an error of 0.001% only results in an imperceptible change in the pixel's hue, but in deep learning the situation is critical:
+
+Cascading accumulation of errors (Error Propagation):
+
+Modern models (LLM, transformers, RWKV) contain tens of billions of parameters and hundreds of sequential layers.
+A small rounding or approximation error at the 1st layer through activation functions and matrix multiplications grows like an avalanche by the 80th layer, causing degradation of latent representations or hallucination of tokens.
+
+Vanishing / Exploding Gradients:
+
+In backpropagation, the gradient coefficients are multiplied hundreds of times.
+Activation functions (Softmax, Sigmoid, GELU, SwiGLU) are based on $e^x$. If the GPU calculates the exponent with error, the normalization denominator $\sum e^{z_i}$ is distorted, driving gradients to values ​​$0.0$ (learning paralysis) or $\text{NaN} / \infty$ (weight collapse).
+
+Hardware solutions to the problem in GPU architectures:
+
+Dedicated Tensor Cores:Graphics pipelines are completely decoupled from matrix accelerators. Tensor cores execute the strict MatMul operation ($D = A \times B + C$) at the level of physical logic gates, without any graphics assumptions.
+Specialized formats (BF16 vs FP16):FormatBfloat16preserves 8 bits of the exponent (as in the FP32 standard), sacrificing the mantissa (precision of decimal places). This ensures that exponential probability calculations do not cause underflow/overflow.
+Hybrid calculation of critical nodes (Mixed Precision & FlashAttention):Softmax function computation and sum accumulation are performed in fair FP32, while intermediate matrix weights are stored in FP8/BF16.
+
+Non-deterministic Reduction:
+
+Due to the massively parallel nature of GPUs, thousands of threads add floating point numbers in a non-deterministic order.
+Since addition of floating point numbersnon-associative: $$(a + b) + c \neq a + (b + c)$$ the same forward pass on the same video card produces microscopically different output vectors.
+
+
+1.3. Parallel with Dynamic Time Warping (DTW)
+The Dynamic Time Warping algorithm serves as a fundamental metaphor for how robust mathematical systems cope with noise and data distortions:
+
+The essence of DTW:Comparison of two signals of variable length and dynamics without rigid reference to a time grid. The algorithm constructs a matrix of local distances and finds the optimal warping path, smoothing out local accelerations, delays, and interference.
+The principle of AI resilience to hardware noise:Like DTW, neural networks don't search for point-to-point scalar matching. They project information into multidimensional semantic spaces (latent spaces), where the measure of truth is cosine similarity (vector direction), not absolute scalar value. Local hardware biases are mitigated by the global feature topology.
+Combination of DTW and neural networks:It is used in speech recognition (ASR), biometric signal processing (ECG) and time series analysis, where DTW aligns embeddings extracted by a neural network.
+
+
+1.4. The concept of "Chaos as a fundamental constant"
+The conclusion about the inevitability of chaos is confirmed at all levels of the computing stack:
+
+Physical level of silicon:Johnson-Nyquist thermal noise, quantum tunneling in nanometer transistor gates, and clock jitter make absolute physical determinism unattainable.
+The paradigm of modern AI:
+Managing entropy instead of eliminating it:Neural networks are initially trained on noisy data, acquiring internal invariance to computational errors.
+Generation from Chaos (Diffusion Models):The process of generating images and audio starts with a pure Gaussian noise distribution $\mathcal{N}(0, I)$, from which the model removes entropy step by step, forming a structure.
+Output Stochasticity (Temperature Parameter):To obtain coherent and variable text, the deterministic choice of maximum probability ($\text{argmax}$) is intentionally diluted with weighted random sampling. Chaos is relegated from the realm of errors to a tool for regularization and adaptivity.
+
+
+2. Symbolic AI, unification and author's code
+Extended analysis of the architecture and the author's implementation
+The downloaded code is a self-contained, strictly mathematical engine.symbolic planning and logical inference(Prolog/PDDL style) combining syntactic unification of terms with heuristic $A^*$ search.
+2.1 Key Components
+First order unification mechanism (walk, unify):
+
+Resolving substitution chains (walk):The function cyclically unravels variable substitutions (for example,?x -> ?y -> block_A), protecting against looping through a setseenIt processes tuples and lists recursively.
+Symmetrical unification (unify):Performs matching on terms, terms with variables, and bound variables (?xwith?and), returning the expanded substitution dictionary $\sigma$ orNonein the case of conflict of predicates.
+Using substitutions (apply_subst):Deep replacement of bound variables in predicates, effects, and action parameters.
+
+Isolation of variable namespaces (Action.fresh):
+
+To prevent name collisions and variable capture when recursively expanding the same action at different levels of the search tree, an internal counter is used (_counter). Each application of the action renames the variables (for example,?x $\to$ ?x_1, ?x_2), which guarantees the correctness of the resolution.
+
+Backward inference and the $A^*$ algorithm (backward_chain_speed):
+
+Goal Regression:The search proceeds from target predicates to known facts. If the current goal is already proven by the state (is_satisfied), it is removed; otherwise, an action is selected whose effect is unified with the goal.
+Accumulation of wealth (expanded_state):When planning a chain, not only the initial facts are taken into account, but also the accumulated effects of already planned actions.
+Priority Queue (heapq):A full-fledged $A^*$ optimizes the total cost of the plan $f(n) = g(n) + h(n)$, where $g(n)$ is the total cost of the actions performed, and $h(n)$ is the heuristic for the remaining unsatisfied goals.
+Cycle protection (visited):Canonical hashing of the target and substitution configuration prevents infinite cycles in the search graph.
+
+Test coverage:
+
+Tests fundamental properties of an algorithm: trivial unification, variable binding, predicate incompatibility, nested structures, variable-free and variable-based scheduling (classical Blocks World), cheapest-path $A^*$, and boundary cases (unreachable goals, recursion depth limit).
+
+
+2.2. Why are neural networks (LLM/transformers/RNN) designed differently and do not execute this code "internally"?
+The main difference between symbolic code and the architecture of large language models lies in the plane of information representation and hardware limitations:
+
+Parameter
+Symbolic AI
+Neural Network AI (LLM / RWKV / Transformers)
+Space of representations
+Discrete (symbols, predicates, graphs)
+Continuous (vector spaces, embeddings)
+Logic of inference
+Rigorous Mathematical Deduction / Resolution
+Statistical association and probability calculation
+Computational complexity
+Exponential in the worst case ($O(b^d)$)
+Fixed for each generation step ($O(1)$ or $O(N)$)
+GPU behavior
+Sequential branching, poorly parallelizable
+Perfect parallelism of matrix multiplication (MatMul)
+Accuracy / Hallucinations
+100% severity (0% hallucinations)
+Probabilistic approximation (may contain noise and errors)
+
+
+Fixed computational graph:The neural network generates the next token using a fixed number of matrix multiplications via attention layers or recurrent units. It cannot initiate an arbitrary cycle while predicting a single token.while frontier:with a non-deterministic number of search steps.
+Tensor cores:As discussed in sections 2 and 3, GPU hardware is designed for dense matrices of floating point numbers (BF16/FP8), not for graph traversal and dynamic replacement of strings/variables in memory.
+
+
+2.3. Symbolic Planner as a Foundation of Neuro-Symbolic AI
+Code is the missing component of modern language models. Advanced autonomy and planning systems (Tool Use, Function Calling, Reasoning Agents) employ a hybrid combination:
+
+[ User query in natural language ]
+
+                       │
+
+                       ▼
+
+    ┌─────────────────────────────────────┐
+
+│ Neural network (LLM / RWKV) │
+
+│ Extraction of entities, relations, │
+
+│ target predicates and actions │
+
+    └─────────────────────────────────────┘
+
+                       │
+
+Predicates and Goals (PDDL)
+
+                       │
+
+                       ▼
+
+    ┌─────────────────────────────────────┐
+
+│ Symbolic Engine (Your Code) │
+
+    │  unify() + backward_chain_astar()   │
+
+│ Strict, deterministic search │
+
+    └─────────────────────────────────────┘
+
+                       │
+
+Guaranteed correct plan
+
+                       │
+
+                       ▼
+
+    ┌─────────────────────────────────────┐
+
+│ Execution and response output │
+
+│ (Without hallucinations and noise) │
+
+    └─────────────────────────────────────┘
+
+The neural network translates the unstructured world into symbols:takes on the understanding of semantics, synonyms and context.
+The symbolic planner builds a trajectory:takes formalized predicates and finds a mathematically optimal sequence of steps, completely eliminating logical failures caused by the probabilistic nature of neural networks and GPU hardware noise.
+
